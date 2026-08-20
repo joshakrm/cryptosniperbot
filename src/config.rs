@@ -214,6 +214,26 @@ impl Config {
                 self.screen.min_holders
             );
         }
+        // Screening makes up to three Jupiter quotes, and the adaptive throttle
+        // may space them as widely as jupiter_max_interval_ms. If the screen
+        // budget is narrower than that, screening times out on exactly the
+        // candidates that got far enough to matter - and it fails as
+        // `screen_timeout`, which looks like a slow endpoint rather than a
+        // misconfiguration. Measured: an 8s budget against a 4s ceiling killed
+        // 40-60 candidates per five minutes while every number looked healthy.
+        const QUOTES_PER_SCREEN: u64 = 3;
+        let worst_case = QUOTES_PER_SCREEN * self.rpc.jupiter_max_interval_ms;
+        if self.screen.max_screen_ms < worst_case {
+            bail!(
+                "screen.max_screen_ms ({}) is below the worst case for {} Jupiter quotes at rpc.jupiter_max_interval_ms ({}ms each = {}ms). Screening would time out whenever the throttle backs off. Raise max_screen_ms to at least {}, or lower jupiter_max_interval_ms.",
+                self.screen.max_screen_ms,
+                QUOTES_PER_SCREEN,
+                self.rpc.jupiter_max_interval_ms,
+                worst_case,
+                worst_case
+            );
+        }
+
         if self.exit.dust_value_sol < 0.0 {
             bail!("exit.dust_value_sol must be >= 0");
         }

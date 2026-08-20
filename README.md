@@ -433,6 +433,23 @@ settled it. Adversarial verification cuts false positives, and it will
 occasionally cut a true one — a reason to keep running the thing against reality
 rather than treating a clean review as proof.
 
+### Two settings that must agree, and nothing was checking
+
+Screening makes up to three Jupiter quotes, and the adaptive throttle may space
+them as widely as `jupiter_max_interval_ms`. If `screen.max_screen_ms` is
+narrower than that product, screening times out on exactly the candidates that
+got far enough to reach routing.
+
+Measured: an 8s budget against a 4s ceiling produced 40-60 `screen_timeout`
+rejections per five minutes. Every individual number looked healthy - the
+throttle was correctly backing off to avoid 429s, the endpoint was fine, the
+median screen took 385ms - and approvals still went to nearly zero. The throttle
+protecting itself from rate limits pushed screening past its own deadline.
+
+`Config::validate` now refuses to start on that combination and says which value
+to change. It is the kind of interlock that no single check can see and that
+costs a whole run to discover empirically.
+
 ### Read mid-run PnL with suspicion
 
 Losers hit their stop within seconds; winners need minutes to reach a

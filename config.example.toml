@@ -15,7 +15,8 @@ jupiter_min_interval_ms = 400
 # every 429, creeping back when requests land cleanly. The real limit is
 # undocumented and differs per endpoint and plan, so hand-tuning meant
 # guessing - a flat 400ms still lost 21% of screens.
-jupiter_max_interval_ms  = 4000   # slowest it will back off to
+jupiter_max_interval_ms  = 2500   # slowest it will back off to; 3 quotes at
+                                  # this rate must fit inside max_screen_ms
 jupiter_mark_multiplier  = 3      # marks wait 3x a screening quote
 timeout_ms = 4000
 commitment = "confirmed"
@@ -55,7 +56,9 @@ require_lp_burned  = true
 max_roundtrip_loss_bps = 1500               # buy+sell round trip via Jupiter, 15%
                                             # quoted at risk.position_size_sol, the size
                                             # you actually trade - impact is size-dependent
-max_screen_ms      = 8000                   # give up on a candidate after this
+max_screen_ms      = 15000  # must exceed 3 x jupiter_max_interval_ms, or
+                            # screening times out exactly when the throttle
+                            # backs off. Validated at startup.
 # What to do when a check cannot RUN (rpc error, timeout, throttling) as opposed
 # to running and failing. "reject" is the default and the safe answer: an
 # unanswered question about safety is not a safe answer. Set "advisory" only if

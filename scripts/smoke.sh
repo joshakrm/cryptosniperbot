@@ -33,7 +33,11 @@ sep "6. live.enabled = true (expect refusal to start, not silent pretending)"
 sed -e "s|YOUR_KEY|dummy|g" -e "s|^enabled = false|enabled = true|" "$EX" > "$DIR/live.toml"
 "$BIN" --config "$DIR/live.toml" run 2>&1 | tail -3
 
-sep "7. position_size_sol = 0 (expect refusal)"
+sep "7. screen budget narrower than the throttle can back off to (expect refusal)"
+sed -e "s|YOUR_KEY|dummy|g" -e "s|^max_screen_ms.*|max_screen_ms = 3000|" "$EX" > "$DIR/budget.toml"
+"$BIN" --config "$DIR/budget.toml" screen "$MINT" 2>&1 | tail -3
+
+sep "8. position_size_sol = 0 (expect refusal)"
 sed -e "s|YOUR_KEY|dummy|g" -e "s|^position_size_sol.*|position_size_sol = 0.0|" "$EX" > "$DIR/size.toml"
 "$BIN" --config "$DIR/size.toml" screen "$MINT" 2>&1 | tail -3
 
