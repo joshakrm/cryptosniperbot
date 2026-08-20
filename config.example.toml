@@ -39,6 +39,13 @@ min_holders        = 5      # of the ~20 the RPC returns. The measured
 require_mint_authority_renounced   = true   # else dev can print infinite supply
 require_freeze_authority_renounced = true   # else dev can freeze your token account
 reject_token2022_extensions = true          # transfer hooks / fees / permanent delegate
+# Reject pools whose LP tokens are still outstanding, i.e. whose liquidity
+# the creator can withdraw. Bonding-curve launches (pump.fun pre-migration)
+# have no LP mint at all and always pass. Measured on live PumpSwap pools:
+# 3 burned, 1 with 4.1e12 LP units outstanding, 2 curve-style - so this
+# genuinely discriminates. Also rejects locker-held LP, which is the
+# fail-closed direction; see src/screen/liquidity.rs.
+require_lp_burned  = true
 max_roundtrip_loss_bps = 1500               # buy+sell round trip via Jupiter, 15%
                                             # quoted at risk.position_size_sol, the size
                                             # you actually trade - impact is size-dependent

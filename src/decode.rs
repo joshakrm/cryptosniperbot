@@ -135,6 +135,46 @@ pub fn extract_mint(tx: &Value, quote_mints: &[&str]) -> Option<Pubkey> {
     }
 }
 
+/// The LP mint a pool creation minted, when there is one.
+///
+/// Same ownership discriminator as `extract_mint`, read the other way round:
+/// the base token reaches a pool vault, while LP tokens exist only in the
+/// creator's hands at creation.
+///
+/// Returning None is meaningful, not a failure. A bonding-curve launch
+/// (pump.fun before migration) has no LP mint at all, and that is the safest
+/// possible answer - there is no liquidity position for anyone to withdraw.
+pub fn extract_lp_mint(tx: &Value, base_mint: &str, quote_mints: &[&str]) -> Option<Pubkey> {
+    let meta = tx.get("meta")?;
+    let payer = extract_creator(tx)?;
+
+    let mut owners: HashMap<String, Vec<String>> = HashMap::new();
+    for key in ["postTokenBalances", "preTokenBalances"] {
+        let arr = match meta.get(key).and_then(|v| v.as_array()) {
+            Some(a) => a,
+            None => continue,
+        };
+        for entry in arr {
+            let mint = match entry.get("mint").and_then(|v| v.as_str()) {
+                Some(m) if m != base_mint && !quote_mints.contains(&m) => m,
+                _ => continue,
+            };
+            if let Some(owner) = entry.get("owner").and_then(|v| v.as_str()) {
+                owners
+                    .entry(mint.to_string())
+                    .or_default()
+                    .push(owner.to_string());
+            }
+        }
+    }
+
+    // Held by the creator and nobody else.
+    owners
+        .into_iter()
+        .find(|(_, os)| !os.is_empty() && os.iter().all(|o| *o == payer))
+        .map(|(m, _)| m)
+}
+
 /// The pool's token account for `mint`, when this transaction created one.
 ///
 /// getTokenLargestAccounts returns token ACCOUNT addresses, while balance
@@ -309,6 +349,35 @@ mod tests {
             (NEW, "DEV111"),
         ]);
         assert_eq!(extract_mint(&t, &[WSOL, USDC]), Some(NEW.to_string()));
+    }
+
+    const LPM: &str = "LPMINT11111111111111111111111111111111111111";
+
+    #[test]
+    fn finds_the_lp_mint_a_pool_creation_minted() {
+        // Real PumpSwap shape: quote and base reach the vault, LP does not.
+        let t = tx_owned(&[
+            (WSOL, "VAULT"),
+            (LPM, "DEV111"),
+            (NEW, "VAULT"),
+            (NEW, "DEV111"),
+        ]);
+        assert_eq!(extract_lp_mint(&t, NEW, &[WSOL, USDC]), Some(LPM.to_string()));
+    }
+
+    #[test]
+    fn a_bonding_curve_launch_has_no_lp_mint() {
+        // pump.fun before migration: no third mint exists, so there is no
+        // liquidity position for anyone to withdraw. None is the safe answer.
+        let t = tx_owned(&[(WSOL, "CURVE"), (NEW, "CURVE"), (NEW, "DEV111")]);
+        assert_eq!(extract_lp_mint(&t, NEW, &[WSOL, USDC]), None);
+    }
+
+    #[test]
+    fn the_base_mint_is_never_mistaken_for_the_lp_mint() {
+        // The creator holds base tokens too; that must not make it look like LP.
+        let t = tx_owned(&[(WSOL, "VAULT"), (NEW, "DEV111")]);
+        assert_eq!(extract_lp_mint(&t, NEW, &[WSOL, USDC]), None);
     }
 
     #[test]

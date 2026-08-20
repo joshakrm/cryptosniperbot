@@ -108,6 +108,7 @@ pass. A false reject costs one missed trade; a false accept costs the position.
 | **`sell_route`** | **You can buy but not exit. This is the honeypot test.** |
 | `roundtrip` | Fees and spread eat you alive before any price move |
 | `depth` | Pool cannot absorb your size without extreme impact |
+| **`lp_burned`** | **The creator can withdraw the pool out from under you** |
 
 A check has three outcomes, not two. **Failed** means it ran and the answer
 disqualified the token. **Unavailable** means it could not run at all — an RPC
@@ -355,6 +356,23 @@ So `min_holders` is a coarse switch, not a dial. Moving it 10 → 5 changes the
 pass rate only 20% → 25%, because 5 sits in the empty middle. The meaningful
 settings are ~10 (only tokens with traction) or ~2 (nearly everything).
 
+### One PumpSwap pool in four has withdrawable liquidity
+
+Extracting the LP mint from the launch transaction (the non-quote mint held only
+by the creator, the same discriminator that separates it from the base token)
+and reading its supply:
+
+```
+3 pools   LP supply 0            burned, liquidity locked
+1 pool    4.1e12 units outstanding   the creator can withdraw the pool
+2 pools   no LP mint at all       bonding curve, nothing to withdraw
+```
+
+Every other check in this repo passes that fourth pool without comment: the
+token is fine, the authorities are renounced, it is sellable right now. The rug
+does not touch the token at all — it removes the money. That is what `lp_burned`
+catches, and it is why it was worth building when metadata mutability was not.
+
 ### The aggregator is the real rate limit
 
 Position marks vastly outnumber screening quotes — six positions polled every
@@ -399,11 +417,20 @@ surprise you:
    *hostile* extensions rather than the token program itself — writing that
    check as "reject Token-2022" would silently reject the entire venue while
    looking like it was working.
-4. **No LP-burn check.** Confirming locked or burned liquidity needs pool
-   account layout decoding per venue. Not implemented — a token can pass every
-   check here and still have pullable liquidity.
-5. **No metadata mutability check.** Requires Metaplex PDA derivation, which
-   needs the `solana-sdk` dependency this build deliberately avoids.
+4. **LP locked in a third-party locker reads as unlocked.** `lp_burned` keys
+   off the LP mint's supply, so a pool whose LP is locked rather than burned
+   reports a non-zero supply and is rejected. That is the fail-closed direction
+   and it is deliberate: verifying a locker would mean resolving every holder's
+   owner, and the set of locker programs is not enumerable anyway.
+5. **No metadata mutability check — deliberately, and measured.** DAS
+   `getAsset` exposes `mutable` for one extra call with no `solana-sdk`, so the
+   cost was never the obstacle. The obstacle is that it carries no signal:
+   **25 of 25 sampled live mints reported `mutable: true`**, across pump.fun and
+   PumpSwap alike. A check that cannot ever reject anything is not a safety
+   check, it is a per-candidate RPC call that makes the report look thorough.
+   It would also be the wrong tool regardless — mutable metadata lets a dev
+   change the name and picture, which matters to a human reading a token page
+   and not at all to a bot buying on mechanical criteria.
 6. **Holder concentration is weak on fresh pump.fun launches.** The bonding
    curve legitimately holds nearly all supply at t=0, so the check is advisory
    on that venue rather than fatal.

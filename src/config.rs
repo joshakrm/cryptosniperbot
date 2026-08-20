@@ -31,6 +31,7 @@ pub struct RpcConfig {
     pub jupiter_min_interval_ms: u64,
 }
 fn d_jup_interval() -> u64 { 250 }
+fn d_true() -> bool { true }
 fn d_timeout() -> u64 { 4000 }
 fn d_commitment() -> String { "confirmed".to_string() }
 
@@ -90,6 +91,12 @@ pub struct ScreenConfig {
     pub require_mint_authority_renounced: bool,
     pub require_freeze_authority_renounced: bool,
     pub reject_token2022_extensions: bool,
+    /// Reject pools whose LP tokens are still outstanding, i.e. whose liquidity
+    /// the creator can withdraw. Bonding-curve launches have no LP mint at all
+    /// and always pass. Rejects locker-held LP too, which is the fail-closed
+    /// direction - see screen/liquidity.rs.
+    #[serde(default = "d_true")]
+    pub require_lp_burned: bool,
     pub max_roundtrip_loss_bps: u64,
     pub max_screen_ms: u64,
     /// Trading through an endpoint that keeps failing means trading blind. Only

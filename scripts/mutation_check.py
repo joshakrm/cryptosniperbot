@@ -101,6 +101,13 @@ MUTATIONS = [
         "        Some(_) => holdings.iter().skip(1).map(|(_, amt)| *amt).collect(),",
         "a_whale_larger_than_the_vault_is_still_counted",
     ),
+    (
+        "outstanding LP treated as burned, so a withdrawable pool passes",
+        "src/screen/liquidity.rs",
+        "        Some(n) => CheckResult::fail(",
+        "        Some(n) if n == u128::MAX => CheckResult::fail(",
+        "outstanding_lp_is_rejected",
+    ),
 ]
 
 

@@ -1,5 +1,6 @@
 pub mod authority;
 pub mod holders;
+pub mod liquidity;
 pub mod routing;
 
 use std::time::Instant;
@@ -14,6 +15,20 @@ use crate::types::{CheckResult, Pubkey, ScreenReport, Severity, Venue};
 fn disqualified(checks: &[CheckResult]) -> bool {
     // Unavailable blocks too: a question we could not answer is not an answer.
     checks.iter().any(|c| !c.passed && c.severity != Severity::Advisory)
+}
+
+/// What the launch transaction revealed, beyond the mint itself.
+///
+/// Bundled rather than passed as loose parameters because both fields come
+/// from the same place and both are legitimately absent when screening a mint
+/// by hand from the CLI, where there is no transaction to read.
+#[derive(Debug, Clone, Default)]
+pub struct LaunchContext {
+    /// The pool's token account for the base mint, so concentration can
+    /// exclude exactly the pool instead of guessing positionally.
+    pub vault: Option<String>,
+    /// The pool's LP mint, when the launch created one.
+    pub lp_mint: Option<String>,
 }
 
 /// Facts about the mint account, read once and reused by later checks.
@@ -55,12 +70,12 @@ impl Screener {
         &self,
         mint: &Pubkey,
         venue: Venue,
-        vault: Option<&str>,
+        ctx: &LaunchContext,
     ) -> ScreenReport {
         let started = Instant::now();
 
         let budget = std::time::Duration::from_millis(self.cfg.max_screen_ms);
-        let report = tokio::time::timeout(budget, self.run_checks(mint, venue, vault)).await;
+        let report = tokio::time::timeout(budget, self.run_checks(mint, venue, ctx)).await;
 
         match report {
             Ok((checks, roundtrip, price)) => ScreenReport {
@@ -100,7 +115,7 @@ impl Screener {
         &self,
         mint: &Pubkey,
         venue: Venue,
-        vault: Option<&str>,
+        ctx: &LaunchContext,
     ) -> (Vec<CheckResult>, Option<i64>, Option<f64>) {
         let mut checks = Vec::new();
 
@@ -125,14 +140,24 @@ impl Screener {
         }
 
         // 2. Holder distribution.
-        checks.extend(holders::check(&self.rpc, &self.cfg, mint, &facts, venue, vault).await);
+        checks.extend(
+            holders::check(&self.rpc, &self.cfg, mint, &facts, venue, ctx.vault.as_deref()).await,
+        );
 
-        // Same reasoning: routing below costs three more external round trips.
         if disqualified(&checks) {
             return (checks, None, None);
         }
 
-        // 3. Routability, depth, and the round-trip honeypot test.
+        // 3. Can the creator simply withdraw the pool? One RPC call, and it is
+        // the only check that catches a rug which leaves the token untouched.
+        // Runs before routing because routing costs three throttled quotes.
+        checks.extend(liquidity::check(&self.rpc, &self.cfg, ctx.lp_mint.as_deref()).await);
+
+        if disqualified(&checks) {
+            return (checks, None, None);
+        }
+
+        // 4. Routability, depth, and the round-trip honeypot test.
         let (route_checks, roundtrip, price) = routing::check(
             &self.jup,
             &self.cfg,

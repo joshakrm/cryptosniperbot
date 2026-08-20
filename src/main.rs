@@ -27,7 +27,7 @@ use crate::journal::Journal;
 use crate::position::PositionManager;
 use crate::risk::RiskManager;
 use crate::rpc::{Jupiter, JupiterPrices, PriceSource, SolanaRpc};
-use crate::screen::Screener;
+use crate::screen::{LaunchContext, Screener};
 use crate::types::Venue;
 
 #[derive(Parser)]
@@ -98,8 +98,11 @@ async fn screen_one(config_path: &Path, mint: &str, venue: &str) -> Result<()> {
 
     // No transaction here, so the pool account is unknown and concentration
     // measures every holder rather than guessing which one is the pool.
+    // No transaction here, so neither the pool account nor the LP mint is
+    // known: concentration measures every holder and the LP check has nothing
+    // to inspect.
     let report = screener
-        .screen(&mint.to_string(), Venue::from_label(venue), None)
+        .screen(&mint.to_string(), Venue::from_label(venue), &LaunchContext::default())
         .await;
 
     println!("\nmint: {mint}");
@@ -300,8 +303,11 @@ async fn handle_candidate(ctx: CandidateCtx, hit: ingest::LogHit) -> Result<()> 
         tokio::time::sleep(Duration::from_millis(ctx.cfg.screen.min_pool_age_ms)).await;
     }
 
-    let vault = decode::extract_vault_account(&tx, &mint);
-    let report = ctx.screener.screen(&mint, hit.venue, vault.as_deref()).await;
+    let launch = LaunchContext {
+        vault: decode::extract_vault_account(&tx, &mint),
+        lp_mint: decode::extract_lp_mint(&tx, &mint, &quote_mints),
+    };
+    let report = ctx.screener.screen(&mint, hit.venue, &launch).await;
     ctx.journal.write_typed("screen", &report).await;
 
     if !report.approved() {
