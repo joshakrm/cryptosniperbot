@@ -380,9 +380,19 @@ few seconds is ~2 req/s against ~0.4 req/s of screening — so marks starve
 screening and candidates come back unscreenable through no fault of their own.
 At six concurrent positions, **33% of screens were degraded by HTTP 429**.
 
-`jupiter_min_interval_ms` serialises all Jupiter traffic through one shared
-budget so requests queue instead of failing. Queueing beats firing and failing,
-because a 429 carries no information about the token.
+All Jupiter traffic is serialised through one shared budget so requests queue
+instead of failing, and marks wait a multiple of the screening interval so they
+stand aside. Queueing beats firing and failing, because a 429 carries no
+information about the token.
+
+The interval is **adaptive rather than configured**, and that turned out to
+matter. Hand-tuning it was guessing at an undocumented limit that differs per
+endpoint and plan: a flat 400ms still lost 21% of screens. It now backs off
+multiplicatively on every 429 and creeps back while requests land cleanly, so it
+finds the sustainable rate itself and re-finds it when conditions change. A
+throttled request is also retried once, so being throttled costs a delay rather
+than the whole candidate. The heartbeat reports the interval it settled on — a
+value pinned at the ceiling means the endpoint is your bottleneck.
 
 ### A stop loss sets the trigger, not the fill
 

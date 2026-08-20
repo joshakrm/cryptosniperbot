@@ -11,12 +11,12 @@ jupiter_url = "https://lite-api.jup.ag/swap/v1"
 # The free tier throttles near 1/sec; queueing beats firing and failing,
 # because a 429 is indistinguishable from real information.
 jupiter_min_interval_ms = 400
-# Marks wait longer than screening quotes on purpose. Both measure against
-# the same last-request time, so a mark needing a big gap stands aside for
-# screening needing a small one. This is what caps total Jupiter load
-# regardless of position count - so raising concurrency now costs mark
-# freshness (looser stops) rather than screening coverage (missed tokens).
-jupiter_mark_interval_ms = 1200
+# The throttle is ADAPTIVE: it starts at the floor above and backs off on
+# every 429, creeping back when requests land cleanly. The real limit is
+# undocumented and differs per endpoint and plan, so hand-tuning meant
+# guessing - a flat 400ms still lost 21% of screens.
+jupiter_max_interval_ms  = 4000   # slowest it will back off to
+jupiter_mark_multiplier  = 3      # marks wait 3x a screening quote
 timeout_ms = 4000
 commitment = "confirmed"
 

@@ -66,15 +66,16 @@ MUTATIONS = [
         "picks_the_base_mint_when_an_lp_mint_was_also_created",
     ),
     (
-        "Jupiter throttling reported as an absent route instead of an error",
+        "any non-2xx reported as an absent route instead of an error "
+        "(429 has its own branch now, so a 5xx is what exercises this line)",
         "src/rpc.rs",
-        "        if !status.is_success() {" + LF
-        + "            return Err(anyhow!(\"jupiter quote http {status}\"));" + LF
-        + "        }",
-        "        if !status.is_success() {" + LF
-        + "            return Ok(None);" + LF
-        + "        }",
-        "throttling_is_an_error_not_an_absent_route",
+        "            if !status.is_success() {" + LF
+        + "                return Err(anyhow!(\"jupiter quote http {status}\"));" + LF
+        + "            }",
+        "            if !status.is_success() {" + LF
+        + "                return Ok(None);" + LF
+        + "            }",
+        "a_server_error_is_an_error_not_an_absent_route",
     ),
     (
         "Token-2022 screening back to a denylist, so unknown extensions pass",
@@ -107,6 +108,20 @@ MUTATIONS = [
         "        Some(n) => CheckResult::fail(",
         "        Some(n) if n == u128::MAX => CheckResult::fail(",
         "outstanding_lp_is_rejected",
+    ),
+    (
+        "no retry on 429, so a transient throttle costs the whole candidate",
+        "src/rpc.rs",
+        "        const ATTEMPTS: u32 = 2;",
+        "        const ATTEMPTS: u32 = 1;",
+        "a_transient_throttle_is_retried_and_succeeds",
+    ),
+    (
+        "throttling ignored, so the client keeps hammering a limited endpoint",
+        "src/rpc.rs",
+        "        let doubled = t.interval.checked_mul(2).unwrap_or(self.ceiling);",
+        "        let doubled = t.interval;",
+        "being_throttled_widens_the_interval",
     ),
 ]
 

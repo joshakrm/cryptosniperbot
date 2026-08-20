@@ -147,6 +147,14 @@ pub enum Priority {
     Mark,
 }
 
+/// Adaptive send budget, shared by every clone of the client.
+#[derive(Debug)]
+struct Throttle {
+    last: Option<Instant>,
+    /// Current spacing between requests. Discovered, not configured.
+    interval: Duration,
+}
+
 /// Jupiter quote client. Two jobs:
 ///
 ///   1. price discovery for entry and exit marks
@@ -158,9 +166,10 @@ pub struct Jupiter {
     /// Shared across every clone, so screening quotes and position marks draw
     /// from ONE budget. A 429 tells us nothing about a token, so the cheapest
     /// fix is not to provoke one: queue instead of firing and failing.
-    gate: Arc<tokio::sync::Mutex<Option<Instant>>>,
-    min_interval: Duration,
-    mark_interval: Duration,
+    throttle: Arc<tokio::sync::Mutex<Throttle>>,
+    floor: Duration,
+    ceiling: Duration,
+    mark_multiplier: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -179,43 +188,75 @@ impl Jupiter {
             .timeout(Duration::from_millis(cfg.timeout_ms))
             .build()
             .context("building jupiter http client")?;
+        let floor = Duration::from_millis(cfg.jupiter_min_interval_ms);
         Ok(Self {
             client,
             base: cfg.jupiter_url.trim_end_matches('/').to_string(),
-            gate: Arc::new(tokio::sync::Mutex::new(None)),
-            min_interval: Duration::from_millis(cfg.jupiter_min_interval_ms),
-            mark_interval: Duration::from_millis(cfg.jupiter_mark_interval_ms),
+            // Start at the floor and let the endpoint push us back.
+            throttle: Arc::new(tokio::sync::Mutex::new(Throttle {
+                last: None,
+                interval: floor,
+            })),
+            floor,
+            ceiling: Duration::from_millis(cfg.jupiter_max_interval_ms),
+            mark_multiplier: cfg.jupiter_mark_multiplier.max(1),
         })
     }
 
-    /// Wait until we are allowed to make another request.
+    /// Wait for a turn, at the interval the endpoint has shown it will tolerate.
     ///
-    /// The lock is deliberately held across the sleep: that is what serialises
-    /// callers. Position marks vastly outnumber screening quotes (six positions
-    /// polled every few seconds against a handful of candidates a minute), so
-    /// without this the marks starve the screening and candidates come back
-    /// unscreenable through no fault of their own.
-    async fn throttle(&self, priority: Priority) {
-        // Both classes measure against the SAME last-request timestamp, so a
-        // mark requiring a long gap since any request naturally stands aside
-        // for screening, which requires only a short one. Total outbound rate
-        // stays bounded no matter how many positions are open - which is what
-        // lets concurrency rise without costing screening coverage.
-        let interval = match priority {
-            Priority::Screening => self.min_interval,
-            Priority::Mark => self.mark_interval.max(self.min_interval),
-        };
-        if interval.is_zero() {
+    /// The lock is held across the sleep: that is what serialises callers.
+    ///
+    /// The interval is ADAPTIVE rather than configured, because the real limit
+    /// is not documented and changes with the endpoint and the plan. Hand-tuning
+    /// it meant guessing: a flat 400ms still lost 21% of screens to 429s, while
+    /// a safe guess would throttle a paid endpoint far below what it allows.
+    /// Additive-decrease / multiplicative-increase finds the sustainable rate on
+    /// its own and re-finds it when conditions change.
+    async fn wait_turn(&self, priority: Priority) {
+        let mut t = self.throttle.lock().await;
+
+        // Marks measure against the same clock as screening but need a wider
+        // gap, so a mark naturally stands aside for a screening quote.
+        let mut need = t.interval;
+        if priority == Priority::Mark {
+            need *= self.mark_multiplier;
+        }
+        if need.is_zero() {
             return;
         }
-        let mut last = self.gate.lock().await;
-        if let Some(prev) = *last {
+
+        if let Some(prev) = t.last {
             let elapsed = prev.elapsed();
-            if elapsed < interval {
-                tokio::time::sleep(interval - elapsed).await;
+            if elapsed < need {
+                tokio::time::sleep(need - elapsed).await;
             }
         }
-        *last = Some(Instant::now());
+        t.last = Some(Instant::now());
+    }
+
+    /// Back off hard. Being throttled costs a whole candidate, so the response
+    /// should be immediate rather than gradual.
+    async fn note_throttled(&self) {
+        let mut t = self.throttle.lock().await;
+        let doubled = t.interval.checked_mul(2).unwrap_or(self.ceiling);
+        t.interval = doubled.min(self.ceiling).max(self.floor);
+    }
+
+    /// Creep back towards the floor while requests are landing cleanly.
+    /// Deliberately slower than the back-off: probing too eagerly just
+    /// reproduces the 429 we backed off from.
+    async fn note_accepted(&self) {
+        let mut t = self.throttle.lock().await;
+        t.interval = t
+            .interval
+            .saturating_sub(Duration::from_millis(20))
+            .max(self.floor);
+    }
+
+    /// Current spacing, for logging and tests.
+    pub async fn current_interval(&self) -> Duration {
+        self.throttle.lock().await.interval
     }
 
     /// Returns Ok(None) when Jupiter has no route at all - which for a sell is
@@ -229,70 +270,93 @@ impl Jupiter {
         priority: Priority,
     ) -> Result<Option<Quote>> {
         let url = format!("{}/quote", self.base);
+        // One retry: a throttle should cost a delay, not a whole candidate.
+        const ATTEMPTS: u32 = 2;
 
-        self.throttle(priority).await;
-        let resp = self
-            .client
-            .get(&url)
-            .query(&[
-                ("inputMint", input_mint),
-                ("outputMint", output_mint),
-                ("amount", &amount.to_string()),
-                ("slippageBps", &slippage_bps.to_string()),
-                ("onlyDirectRoutes", "false"),
-            ])
-            .send()
-            .await
-            .context("jupiter quote request failed")?;
+        for attempt in 0..ATTEMPTS {
+            self.wait_turn(priority).await;
 
-        // Classify the status; never collapse it. A 429 or a 5xx says nothing
-        // whatsoever about whether a route exists, and reporting that as "no
-        // route" is precisely how aggregator throttling turns into positions
-        // force-closed at a fabricated -100%. Only Jupiter's own "I looked and
-        // there is nothing" answers may become Ok(None).
-        let status = resp.status();
-        if status == reqwest::StatusCode::BAD_REQUEST
-            || status == reqwest::StatusCode::NOT_FOUND
-        {
-            return Ok(None);
+            let resp = self
+                .client
+                .get(&url)
+                .query(&[
+                    ("inputMint", input_mint),
+                    ("outputMint", output_mint),
+                    ("amount", &amount.to_string()),
+                    ("slippageBps", &slippage_bps.to_string()),
+                    ("onlyDirectRoutes", "false"),
+                ])
+                .send()
+                .await
+                .context("jupiter quote request failed")?;
+
+            let status = resp.status();
+
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                self.note_throttled().await;
+                if attempt + 1 < ATTEMPTS {
+                    continue;
+                }
+                return Err(anyhow!("jupiter quote http 429 after {ATTEMPTS} attempts"));
+            }
+
+            self.note_accepted().await;
+
+            // Classify the status; never collapse it. A 5xx says nothing
+            // whatsoever about whether a route exists, and reporting that as
+            // "no route" is precisely how aggregator trouble turns into
+            // positions force-closed at a fabricated -100%. Only Jupiter's own
+            // "I looked and there is nothing" answers may become Ok(None).
+            if status == reqwest::StatusCode::BAD_REQUEST
+                || status == reqwest::StatusCode::NOT_FOUND
+            {
+                return Ok(None);
+            }
+            if !status.is_success() {
+                return Err(anyhow!("jupiter quote http {status}"));
+            }
+
+            let v: Value = resp.json().await.context("jupiter quote non-json")?;
+            if v.get("error").is_some() {
+                return Ok(None);
+            }
+
+            let in_amount = v
+                .get("inAmount")
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse::<u64>().ok());
+            let out_amount = v
+                .get("outAmount")
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse::<u64>().ok());
+
+            let (in_amount, out_amount) = match (in_amount, out_amount) {
+                (Some(i), Some(o)) if o > 0 => (i, o),
+                _ => return Ok(None),
+            };
+
+            let price_impact_pct = v
+                .get("priceImpactPct")
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+                .or_else(|| v.get("priceImpactPct").and_then(|x| x.as_f64()))
+                .unwrap_or(0.0);
+
+            let route_hops = v
+                .get("routePlan")
+                .and_then(|x| x.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+
+            return Ok(Some(Quote {
+                in_amount,
+                out_amount,
+                price_impact_pct,
+                route_hops,
+            }));
         }
-        if !status.is_success() {
-            return Err(anyhow!("jupiter quote http {status}"));
-        }
 
-        let v: Value = resp.json().await.context("jupiter quote non-json")?;
-        if v.get("error").is_some() {
-            return Ok(None);
-        }
-
-        let in_amount = v
-            .get("inAmount")
-            .and_then(|x| x.as_str())
-            .and_then(|s| s.parse::<u64>().ok());
-        let out_amount = v
-            .get("outAmount")
-            .and_then(|x| x.as_str())
-            .and_then(|s| s.parse::<u64>().ok());
-
-        let (in_amount, out_amount) = match (in_amount, out_amount) {
-            (Some(i), Some(o)) if o > 0 => (i, o),
-            _ => return Ok(None),
-        };
-
-        let price_impact_pct = v
-            .get("priceImpactPct")
-            .and_then(|x| x.as_str())
-            .and_then(|s| s.parse::<f64>().ok())
-            .or_else(|| v.get("priceImpactPct").and_then(|x| x.as_f64()))
-            .unwrap_or(0.0);
-
-        let route_hops = v
-            .get("routePlan")
-            .and_then(|x| x.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0);
-
-        Ok(Some(Quote { in_amount, out_amount, price_impact_pct, route_hops }))
+        Err(anyhow!("jupiter quote exhausted its attempts"))
     }
 }
 
@@ -417,12 +481,17 @@ Connection: close
     }
 
     fn jup_throttled(base: String, min_interval_ms: u64) -> Jupiter {
+        let floor = Duration::from_millis(min_interval_ms);
         Jupiter {
             client: reqwest::Client::new(),
             base,
-            gate: Arc::new(tokio::sync::Mutex::new(None)),
-            min_interval: Duration::from_millis(min_interval_ms),
-            mark_interval: Duration::from_millis(min_interval_ms),
+            throttle: Arc::new(tokio::sync::Mutex::new(Throttle {
+                last: None,
+                interval: floor,
+            })),
+            floor,
+            ceiling: Duration::from_millis(4_000),
+            mark_multiplier: 1,
         }
     }
 
@@ -475,6 +544,95 @@ Connection: close
         );
     }
 
+    /// Serve a scripted sequence of responses, one per connection.
+    async fn stub_seq(responses: Vec<(&'static str, &'static str)>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for (status_line, body) in responses {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 {status_line}
+Content-Type: application/json
+Content-Length: {}
+Connection: close
+
+{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                }
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    const OK_BODY: &str = r#"{"inAmount":"1","outAmount":"2"}"#;
+
+    // A throttled request costs a whole candidate, so the response has to be
+    // immediate rather than gradual.
+    #[tokio::test]
+    async fn being_throttled_widens_the_interval() {
+        let base = stub_seq(vec![("429 Too Many Requests", "{}"); 2]).await;
+        let j = jup_throttled(base, 10);
+        let before = j.current_interval().await;
+
+        let r = j.quote("A", "B", 1, 500, Priority::Screening).await;
+        assert!(r.is_err(), "two 429s in a row must surface as an error");
+
+        let after = j.current_interval().await;
+        assert!(after > before, "interval went {before:?} -> {after:?}");
+    }
+
+    // A 429 should cost a delay, not the candidate. The measured failure mode
+    // was 21-33% of screens lost outright to throttling.
+    #[tokio::test]
+    async fn a_transient_throttle_is_retried_and_succeeds() {
+        let base = stub_seq(vec![("429 Too Many Requests", "{}"), ("200 OK", OK_BODY)]).await;
+        let j = jup_throttled(base, 10);
+
+        let q = j.quote("A", "B", 1, 500, Priority::Screening).await;
+        assert!(
+            matches!(q, Ok(Some(_))),
+            "the retry should have recovered the candidate, got {q:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_requests_creep_back_towards_the_floor() {
+        let base = stub_seq(vec![("200 OK", OK_BODY); 6]).await;
+        let j = jup_throttled(base, 10);
+
+        // Push the interval up first.
+        j.note_throttled().await;
+        j.note_throttled().await;
+        let backed_off = j.current_interval().await;
+
+        for _ in 0..5 {
+            let _ = j.quote("A", "B", 1, 500, Priority::Screening).await;
+        }
+        let recovered = j.current_interval().await;
+
+        assert!(
+            recovered < backed_off,
+            "interval should relax while requests land: {backed_off:?} -> {recovered:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn back_off_is_bounded_by_the_ceiling() {
+        let base = stub_seq(vec![]).await;
+        let j = jup_throttled(base, 10);
+        for _ in 0..40 {
+            j.note_throttled().await;
+        }
+        assert!(j.current_interval().await <= j.ceiling);
+    }
+
     // The whole point of the two classes: raising concurrency must cost mark
     // freshness, never screening coverage. Measured live, marks competing
     // equally with screening cost 22-33% of screens to 429s.
@@ -483,7 +641,7 @@ Connection: close
         let body = r#"{"inAmount":"1","outAmount":"2"}"#;
         let base = stub_n("200 OK", body, 4).await;
         let mut j = jup_throttled(base, 40);
-        j.mark_interval = Duration::from_millis(400);
+        j.mark_multiplier = 10;
 
         // Prime the gate, then time each class from the same starting point.
         let _ = j.quote("A", "B", 1, 500, Priority::Screening).await;

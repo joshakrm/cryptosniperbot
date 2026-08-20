@@ -175,6 +175,7 @@ async fn run(config_path: &Path, journal_path: &Path) -> Result<()> {
         let paper = paper.clone();
         let risk = risk.clone();
         let pm = pm.clone();
+        let jup = jup.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             loop {
@@ -186,6 +187,9 @@ async fn run(config_path: &Path, journal_path: &Path) -> Result<()> {
                 // straddle the await point and make this whole spawned future
                 // non-Send, which tokio::spawn rejects.
                 let open = pm.open_count().await;
+                // The throttle discovers its own rate, so surface it: a value
+                // pinned at the ceiling means the endpoint is the bottleneck.
+                let jup_ms = jup.current_interval().await.as_millis() as u64;
                 info!(
                     balance_sol = balance,
                     open,
@@ -193,6 +197,7 @@ async fn run(config_path: &Path, journal_path: &Path) -> Result<()> {
                     pnl_today = pnl,
                     races = attempted,
                     won = landed,
+                    jup_interval_ms = jup_ms,
                     "heartbeat"
                 );
             }

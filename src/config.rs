@@ -29,14 +29,17 @@ pub struct RpcConfig {
     /// queue than to fire and fail. 0 disables the limiter.
     #[serde(default = "d_jup_interval")]
     pub jupiter_min_interval_ms: u64,
-    /// Minimum gap for position marks specifically. Longer than the screening
-    /// interval on purpose: marks are frequent and merely useful, screening is
-    /// rare and decisive. This is what caps total Jupiter load regardless of
-    /// how many positions are open.
-    #[serde(default = "d_jup_mark_interval")]
-    pub jupiter_mark_interval_ms: u64,
+    /// Slowest the adaptive throttle will back off to before giving up on a
+    /// request. Bounds how bad a throttling episode can get.
+    #[serde(default = "d_jup_max_interval")]
+    pub jupiter_max_interval_ms: u64,
+    /// How many times wider a position mark's gap is than a screening quote's.
+    /// Marks are frequent and merely useful; screening is rare and decisive.
+    #[serde(default = "d_jup_mark_mult")]
+    pub jupiter_mark_multiplier: u32,
 }
-fn d_jup_mark_interval() -> u64 { 1200 }
+fn d_jup_max_interval() -> u64 { 4000 }
+fn d_jup_mark_mult() -> u32 { 3 }
 fn d_jup_interval() -> u64 { 250 }
 fn d_true() -> bool { true }
 fn d_timeout() -> u64 { 4000 }
