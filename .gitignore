@@ -1,0 +1,8 @@
+/target
+config.toml
+*.jsonl
+*.log
+KILL
+keypair.json
+*.key
+.env

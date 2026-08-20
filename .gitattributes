@@ -1,0 +1,11 @@
+# This project is edited on Windows but BUILT IN WSL, so everything must stay
+# LF in the working tree. A shell script checked out with CRLF fails in bash
+# with "bad interpreter: /usr/bin/env bash^M", which is a confusing way to
+# discover a line-ending problem.
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.py   text eol=lf
+*.rs   text eol=lf
+*.toml text eol=lf
+*.md   text eol=lf

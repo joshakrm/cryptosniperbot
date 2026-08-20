@@ -1,0 +1,377 @@
+# solsnipe
+
+A Solana new-pool sniper in Rust. Watches pump.fun, PumpSwap, Raydium AMM V4 and
+Raydium CPMM for token launches, screens each candidate against a fail-closed
+safety gauntlet, and trades the survivors.
+
+**Execution is simulated.** Live trading is deliberately not implemented — see
+[Live trading](#live-trading).
+
+### Status
+
+Builds clean in WSL (see [Setup](#setup)), `clippy -D warnings` clean, 62 tests
+passing, and every regression test mutation-checked (10/10 caught).
+
+**Verified against live mainnet** over three 90-second runs on the public RPC:
+
+| | run 1 | run 2 | run 3 |
+|---|---|---|---|
+| detections converted to candidates | 18/35 (51%) | 17/21 (81%) | **45/45 (100%)** |
+| transaction fetch failures | 18 | 0 | 0 |
+| Raydium CPMM false positives | 2 | 0 | 0 |
+| PumpSwap candidates | 0 | 0 | **5** |
+
+Each gap between runs was a real bug found by watching live traffic, not by
+reading the code: unscoped log markers, too-short fetch retries, and the LP-mint
+collision described above.
+
+Also confirmed live: authority checks read correctly on 45/45 candidates, the
+Jupiter round trip priced BONK at 4 bps with a depth probe absorbing 5 SOL at
+0.3% impact, and the fail-closed contract held — the public RPC returned HTTP
+429 mid-screen and the screener **rejected** rather than passing.
+
+**Still unverified:** `holders` / `concentration`. `getTokenLargestAccounts` is
+throttled on every free endpoint (429 on mainnet-beta, 403 on publicnode), so it
+is currently the *only* thing rejecting candidates and needs your own RPC key to
+exercise. Nothing downstream of it — risk gates, paper fills, position
+management — has run against real signals yet, because nothing has reached them.
+
+---
+
+## What it actually does
+
+```
+websocket logsSubscribe  ->  launch detected
+        |
+   getTransaction        ->  extract the launched mint
+        |
+   SCREEN (fail closed)  ->  mint authority, freeze authority, Token-2022
+        |                    extensions, holder concentration, buy route,
+        |                    SELL ROUTE, round-trip loss, depth probe
+        |
+   RISK GATES            ->  concurrency, daily loss, trade cap, cooldown,
+        |                    kill switch
+        |
+   PAPER FILL            ->  slippage + latency penalty + fill probability
+        |
+   POSITION MANAGER      ->  TP ladder / stop / trailing stop / max hold
+        |
+   journal.jsonl         ->  every decision, including the rejections
+```
+
+### Finding the mint without decoding account layouts
+
+Detection deliberately avoids per-venue account layout decoding, which breaks on
+every program upgrade. Instead it reads the token balances a transaction
+touched. Two rules make that work, and both were derived from live traffic
+rather than guessed:
+
+**Markers are scoped to the program that emitted them.** `logsSubscribe` with a
+`mentions` filter delivers the *entire* log stream of any transaction touching
+the program, including lines from every other program in the call tree. Matching
+anywhere in that stream made an arbitrage bot routing through Raydium look like
+a brand-new pool. The log is a flat rendering of a call tree, so tracking
+`invoke` / `success` recovers who actually spoke.
+
+**The LP mint is separated from the base mint by ownership.** A pool creation
+mints LP tokens to the creator *alongside* the base token, so "exactly one
+non-quote mint" silently dropped every PumpSwap launch — 4 detected, 0
+candidates. At creation the LP mint exists only in the creator's hands, while
+the base token is also sitting in the pool vault:
+
+```
+So1111…1112   owner=pool-vault    371730970190   (9)   <- quote
+GLu7LT…347z   owner=CREATOR       472269607342   (9)   <- LP mint
+3YoCWJ…bonk   owner=pool-vault    600000000000   (6)   <- the launch
+3YoCWJ…bonk   owner=CREATOR       400000000000   (6)
+```
+
+So among several non-quote mints, the one with a holder other than the fee payer
+is the launch. A genuine arbitrage transaction has several such mints and is
+still rejected — guessing between them is how you end up buying somebody else's
+swap leg.
+
+### The screening layer is the point
+
+Anyone can write the part that buys. The part that decides *not* to buy is where
+the money is. Every check fails closed: an RPC timeout is a rejection, not a
+pass. A false reject costs one missed trade; a false accept costs the position.
+
+| Check | What it catches |
+|---|---|
+| `mint_authority` | Dev can print unlimited supply and dilute you to zero |
+| `freeze_authority` | Dev can freeze your token account so you never sell |
+| `token2022_extensions` | Transfer hooks, transfer fees, permanent delegate — post-purchase honeypots |
+| `holder_count` | Nobody is actually in this token |
+| `concentration` | Top holders can exit into you at will |
+| `buy_route` | Not tradable yet |
+| **`sell_route`** | **You can buy but not exit. This is the honeypot test.** |
+| `roundtrip` | Fees and spread eat you alive before any price move |
+| `depth` | Pool cannot absorb your size without extreme impact |
+
+A check has three outcomes, not two. **Failed** means it ran and the answer
+disqualified the token. **Unavailable** means it could not run at all — an RPC
+error, a timeout, throttling. Both block the trade by default, but they demand
+opposite responses: the first says screening is working, the second says your
+endpoint is broken. Folding them together makes a throttled RPC look like a wall
+of dangerous tokens, which is exactly what a live run on the public RPC looked
+like before the distinction existed. `stats` reports them separately, and
+`screen.treat_unavailable_as` controls the policy (default: reject).
+
+`sell_route` and `roundtrip` are the highest-value checks here. Authority flags
+tell you what the dev *could* do; a live round-trip quote tells you what the
+market will *actually* let you do right now.
+
+Both legs are quoted at `risk.position_size_sol` — the size you actually trade.
+Price impact is size-dependent, so pricing an entry off a smaller sample
+understates the real fill and makes every later `gain_bps` optimistic.
+
+### Exit rules
+
+| Rule | Behaviour |
+|---|---|
+| Take-profit ladder | Each rung sells a share of the **original** position size, so a ladder summing to 100 fully exits. At most one rung per sweep, so a vertical candle cannot dump the position into its own spike. |
+| Stop loss | Checked first — it is the one rule whose entire job is to be fast. |
+| Trailing stop | Arms only once the peak clears entry by at least the trail width. Otherwise a 25% trail fires *below* entry and silently overrides your 35% stop with a tighter one. |
+| Max hold | Hard timeout, regardless of PnL. |
+| Unroutable | Three consecutive sweeps with no sell route before a position is written off. One failed quote is equally consistent with an aggregator hiccup, and booking a total loss on that turns someone else's outage into your realised loss. |
+| Dust | Measured in SOL **value**, not token count. After a 100x, 0.1% of the tokens is still a tenth of the stake. |
+
+A transport error while marking is treated as *no information* and never acts —
+only an actual "no route" answer counts against a position.
+
+---
+
+## Setup
+
+> **This builds in WSL, not on Windows.** Windows 11 **Smart App Control** is
+> enabled on this machine (`VerifiedAndReputablePolicyState = 1`). It blocks
+> execution of unsigned binaries, which is every build script, proc-macro, and
+> output binary that Rust produces — builds die with `os error 4551`. Smart App
+> Control cannot be re-enabled once turned off without reinstalling Windows, so
+> building in WSL is the sane path. It costs nothing here: this bot only talks
+> websockets and HTTP.
+
+### 1. Prerequisites (already done on this machine)
+
+```bash
+wsl -d Ubuntu -u root -- apt-get install -y build-essential pkg-config libssl-dev
+```
+
+`libssl-dev` matters: `native-tls` resolves to SChannel on Windows but to
+**OpenSSL on Linux**, so the Linux build needs the headers.
+
+### 2. Install Rust in WSL
+
+```bash
+wsl -d Ubuntu -- bash -c "curl -sSfL https://sh.rustup.rs | sh -s -- -y"
+```
+
+### 3. Configure
+
+```bash
+cp /mnt/c/Users/joshr/Documents/solsnipe/config.example.toml /mnt/c/Users/joshr/Documents/solsnipe/config.toml
+```
+
+Edit `config.toml` and set `rpc.http_url` and `rpc.ws_url`. **A public RPC will
+rate-limit you into uselessness** — the free tier at Helius, QuickNode, or Triton
+is the minimum viable setup. The program refuses to start while the `YOUR_KEY`
+placeholder is still there.
+
+`config.toml` is gitignored. Keep it that way.
+
+### 4. Build
+
+The source lives on the Windows filesystem so you can edit it from either side,
+but `target/` goes in the Linux filesystem — that is where the build I/O churn
+is, and `/mnt/c` is slow across the 9p bridge.
+
+```bash
+wsl -d Ubuntu -- bash /mnt/c/Users/joshr/Documents/solsnipe/scripts/wsl-cargo.sh build --release
+```
+
+Run that from **PowerShell or cmd, not Git Bash** — Git Bash rewrites `/mnt/c/...`
+into a Windows path before `wsl.exe` sees it, producing a baffling
+`C:/Program Files/Git/mnt/c/...: No such file or directory`. Prefix with
+`MSYS_NO_PATHCONV=1` if you must use Git Bash.
+
+`scripts/wsl-cargo.sh` sets `CARGO_TARGET_DIR` and forwards whatever you pass to
+cargo. It exists because calling cargo through `wsl.exe -- bash -c "..."` from a
+Windows shell is a quoting minefield: `$HOME` expands on the Windows side before
+WSL sees it, and the inherited Windows PATH contains unescaped parentheses
+(`Program Files (x86)`) that break bash parsing outright.
+
+Working inside WSL directly, add this to `~/.bashrc` and just use cargo normally:
+
+```bash
+export CARGO_TARGET_DIR=$HOME/.cargo-target/solsnipe
+```
+
+## Usage
+
+Run everything from inside WSL (`wsl -d Ubuntu`, then `cd /mnt/c/Users/joshr/Documents/solsnipe`).
+
+Screen a single mint — the fastest way to sanity-check your thresholds against
+tokens whose outcome you already know:
+
+```bash
+cargo run --release -- screen <MINT_ADDRESS> --venue pump_fun
+```
+
+Pass the venue you are actually testing. Concentration is advisory on a pump.fun
+bonding curve and fatal everywhere else, so screening as `unknown` can disagree
+with the verdict the live path would reach.
+
+Run the paper sniper:
+
+```bash
+cargo run --release -- run
+```
+
+Summarise a session:
+
+```bash
+cargo run --release -- stats
+```
+
+Turn up the logging:
+
+```bash
+RUST_LOG=solsnipe=debug cargo run --release -- run
+```
+
+### Kill switch
+
+Create a file named `KILL` in the working directory. Entries stop immediately
+and open positions are flattened on the next sweep. Delete it to resume.
+
+```bash
+touch /mnt/c/Users/joshr/Documents/solsnipe/KILL
+```
+
+It is a file rather than a signal handler on purpose: you can stop the bot from
+any terminal, any script, or a phone over SSH, without finding the process.
+
+---
+
+## Reading your paper results honestly
+
+The failure mode of every home-made sniper backtest is assuming you were first.
+You were not. Three knobs in `[paper]` model that, and they are the difference
+between a strategy and a fantasy:
+
+- **`latency_penalty_bps`** — how far the price ran before your transaction
+  landed. Defaults to 1200 (12%). Setting this near zero produces a beautiful,
+  meaningless equity curve.
+- **`fill_probability`** — the fraction of races you lose outright to faster
+  bots. Defaults to 0.55.
+- **`slippage_bps`** — the spread you actually cross.
+
+Set these from your journal, not from hope. The honest test: **if your paper
+results only work with `latency_penalty_bps` near zero, you do not have a
+strategy — you have a latency problem you have not solved yet.**
+
+What to look at in `stats`:
+
+- **rejections by check** — if one check rejects almost everything, either the
+  threshold is wrong or that check is doing all the work. Both are worth knowing.
+- **races lost (nofill)** — your realistic ceiling on trade count.
+- **win rate vs net PnL** — sniping is usually a low-win-rate, fat-tail game. A
+  60% win rate with negative PnL means your losers are too big; tighten the stop.
+  A 20% win rate with positive PnL is normal and fine.
+
+---
+
+## Development
+
+```bash
+wsl -d Ubuntu -- bash scripts/wsl-cargo.sh test
+wsl -d Ubuntu -- bash scripts/wsl-cargo.sh clippy --all-targets -- -D warnings
+```
+
+The exit rules live in a pure function, `decide_exit` in
+[src/position.rs](src/position.rs), deliberately separated from execution: these
+are the rules that decide when real money leaves a position, so they are worth
+testing without a network, an executor, or a wall clock.
+
+Marks come through a `PriceSource` trait rather than a direct Jupiter call, for
+the same reason. That lets the integration tests drive a whole position through
+mark -> decide -> sell -> accounting with a scripted price series, and assert on
+exact PnL and on the risk slot being released. Those paths are otherwise
+unreachable without a paid RPC endpoint, since `holders` rejects every candidate
+before anything downstream ever runs.
+
+`scripts/smoke.sh` exercises the CLI and, more usefully, every configuration
+**refusal** — the point of a fail-closed design is that it actually refuses.
+
+`scripts/mutation_check.py` reintroduces fixed bugs one at a time and asserts the
+matching test fails. A regression test that still passes against the bug it
+names is worthless, and this catches that. It currently covers **10 bugs that
+were genuinely shipped in this repo**, all 10 caught.
+
+It earned its keep immediately: the trailing-stop test as first written passed
+against the bug it claimed to cover, and only became a real test once its price
+was tightened. Without the mutation check that would have read as green.
+
+```bash
+wsl -d Ubuntu -- bash -lc "cd /mnt/c/Users/joshr/Documents/solsnipe && python3 scripts/mutation_check.py"
+```
+
+## Known gaps
+
+Stated plainly, because a sniper you do not understand is a sniper that will
+surprise you:
+
+1. **Log markers drift.** Detection keys off strings the programs emit
+   (`initialize2`, `Instruction: Create`). Program upgrades change these. If
+   detections dry up, `src/decode.rs::is_launch_log` is the first place to look.
+   Markers are matched only when the target program is the innermost executing
+   program — `logsSubscribe` delivers the *whole* log stream of any transaction
+   that touches the program, so unscoped matching reads an arbitrage bot routing
+   through Raydium as a brand-new pool. That was observed live, not theorised.
+2. **Program IDs are unverified.** The ones in `config.example.toml` are the
+   widely-published values. Verify them on Solscan before trusting them.
+3. **Every pump.fun mint is Token-2022.** Confirmed on live traffic: 18/18
+   candidates in one run. This is why `token2022_extensions` rejects specific
+   *hostile* extensions rather than the token program itself — writing that
+   check as "reject Token-2022" would silently reject the entire venue while
+   looking like it was working.
+4. **No LP-burn check.** Confirming locked or burned liquidity needs pool
+   account layout decoding per venue. Not implemented — a token can pass every
+   check here and still have pullable liquidity.
+5. **No metadata mutability check.** Requires Metaplex PDA derivation, which
+   needs the `solana-sdk` dependency this build deliberately avoids.
+6. **Holder concentration is weak on fresh pump.fun launches.** The bonding
+   curve legitimately holds nearly all supply at t=0, so the check is advisory
+   on that venue rather than fatal.
+7. **`getTokenLargestAccounts` caps at 20 entries**, so `holder_count` is a
+   floor, not the true count.
+8. **Jupiter quotes are not fills.** A route existing in a quote does not
+   guarantee the transaction lands.
+
+---
+
+## Live trading
+
+`live.enabled = true` makes the program **refuse to start**, rather than
+silently pretend to trade. This is intentional.
+
+`src/exec/live.rs` documents what a real implementation needs. The step people
+underestimate is confirmation reconciliation: when a signature confirmation
+times out but the trade actually landed, a naive bot assumes no fill, re-enters,
+and ends up double-sized in a token that is already dumping.
+
+Before wiring any of that up, get a few hundred journalled signals first. If the
+paper numbers do not work with honest latency assumptions, live numbers will be
+worse, not better.
+
+---
+
+## Risk
+
+This trades the most adversarial corner of crypto. Most new token launches go to
+zero, many are engineered specifically to take money from bots exactly like this
+one, and the screening here reduces that exposure without eliminating it. Losing
+the entire balance is a normal outcome, not an edge case.
+
+Not financial advice. Your keys, your machine, your money, your call.

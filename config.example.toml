@@ -1,0 +1,85 @@
+# solsnipe configuration
+# Copy to config.toml and fill in your RPC endpoints. config.toml is gitignored.
+
+[rpc]
+# A public RPC will rate-limit you into uselessness. Get a free key from
+# Helius / QuickNode / Triton and paste the URLs here.
+http_url  = "https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"
+ws_url    = "wss://mainnet.helius-rpc.com/?api-key=YOUR_KEY"
+jupiter_url = "https://lite-api.jup.ag/swap/v1"
+timeout_ms = 4000
+commitment = "confirmed"
+
+[programs]
+# VERIFY THESE against solscan before trusting them. Program IDs get migrated.
+pump_fun          = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+pump_swap         = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+raydium_amm_v4    = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+raydium_cpmm      = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"
+wsol_mint         = "So11111111111111111111111111111111111111112"
+usdc_mint         = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+# Which venues to listen to.
+watch = ["pump_fun", "raydium_amm_v4", "raydium_cpmm", "pump_swap"]
+
+[screen]
+# Every check FAILS CLOSED: if we cannot determine the answer, we reject.
+min_liquidity_sol  = 5.0     # reject thin pools you cannot exit
+max_top10_pct      = 65.0    # reject if top 10 non-pool holders own more than this
+min_holders        = 15
+require_mint_authority_renounced   = true   # else dev can print infinite supply
+require_freeze_authority_renounced = true   # else dev can freeze your token account
+reject_token2022_extensions = true          # transfer hooks / fees / permanent delegate
+max_roundtrip_loss_bps = 1500               # buy+sell round trip via Jupiter, 15%
+                                            # quoted at risk.position_size_sol, the size
+                                            # you actually trade - impact is size-dependent
+max_screen_ms      = 8000                   # give up on a candidate after this
+# What to do when a check cannot RUN (rpc error, timeout, throttling) as opposed
+# to running and failing. "reject" is the default and the safe answer: an
+# unanswered question about safety is not a safe answer. Set "advisory" only if
+# you deliberately want to trade through a flaky endpoint, and expect worse
+# selection when you do.
+treat_unavailable_as = "reject"
+min_pool_age_ms    = 0                      # optional deliberate delay before screening
+
+[risk]
+position_size_sol       = 0.25
+max_concurrent_positions = 3
+max_daily_loss_sol      = 2.0
+max_trades_per_day      = 40
+cooldown_ms             = 3000   # min gap between entries
+kill_switch_file        = "KILL" # create this file to halt all entries immediately
+
+[exit]
+# Ladder: sell `pct` of the remaining position at each `gain_bps` level.
+# pct is a share of the ORIGINAL position size, not of what is left, so a
+# ladder summing to 100 fully exits. Anything over 100 is rejected at startup.
+take_profit = [
+  { gain_bps = 5000,  pct = 50.0 },   # +50%  -> sell half the original size
+  { gain_bps = 15000, pct = 50.0 },   # +150% -> sell the other half
+]
+stop_loss_bps     = 3500   # -35%
+trailing_stop_bps = 2500   # give back 25% from peak
+max_hold_secs     = 900    # hard timeout, 15 min
+poll_interval_ms  = 2000
+# Residual value below which we stop trying to sell. Denominated in SOL, not
+# token count: after a big run-up, 0.1% of the tokens is still real money.
+dust_value_sol    = 0.005
+
+[paper]
+starting_balance_sol = 10.0
+slippage_bps         = 300    # your realistic slippage on entry
+priority_fee_sol     = 0.001  # what you would actually pay per tx
+# THE HONEST KNOB. In a real snipe you are not first. By the time your tx lands
+# the price has already run. Set this from measured data, not hope. 0 = fantasy.
+latency_penalty_bps  = 1200
+# Fraction of signals where your tx would actually have landed at all.
+fill_probability     = 0.55
+
+[live]
+# Live execution is NOT implemented. This block exists so the config shape is
+# stable. Flipping `enabled` to true will refuse to start with an explicit error.
+enabled = false
+keypair_path = ""
+jito_tip_sol = 0.0
+max_slippage_bps = 500

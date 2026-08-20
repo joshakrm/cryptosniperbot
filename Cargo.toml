@@ -1,0 +1,28 @@
+[package]
+name = "solsnipe"
+version = "0.1.0"
+edition = "2021"
+description = "Solana new-pool sniper with fail-closed screening. Paper trading by default."
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+# TLS via native-tls, not rustls, specifically because this builds on Windows.
+# rustls pulls aws-lc-rs, which wants a C compiler and NASM. native-tls on
+# Windows is SChannel: already in the OS, no build toolchain required.
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
