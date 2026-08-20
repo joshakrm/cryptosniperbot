@@ -107,6 +107,15 @@ pub struct ScreenConfig {
     /// direction - see screen/liquidity.rs.
     #[serde(default = "d_true")]
     pub require_lp_burned: bool,
+    /// Run the holder-distribution checks at all.
+    ///
+    /// They need the token-account index, which lags a launch by ~13s, so they
+    /// force a `min_pool_age_ms` wait to be usable. Turning them off is what
+    /// makes a fast-entry configuration possible - and it is a real reduction
+    /// in safety, not a free win: nothing else in the gauntlet looks at how
+    /// supply is distributed.
+    #[serde(default = "d_true")]
+    pub require_holders: bool,
     pub max_roundtrip_loss_bps: u64,
     pub max_screen_ms: u64,
     /// Trading through an endpoint that keeps failing means trading blind. Only

@@ -21,6 +21,13 @@ pub async fn check(
     // None means measure every holder rather than guess which one is the pool.
     vault: Option<&str>,
 ) -> Vec<CheckResult> {
+    if !cfg.require_holders {
+        // Deliberately silent rather than an advisory note: an operator who
+        // turned this off knows it is off, and a per-candidate reminder would
+        // just be noise in the journal.
+        return Vec::new();
+    }
+
     let mut out = Vec::new();
 
     let resp = match rpc.get_token_largest_accounts(mint).await {

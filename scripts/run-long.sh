@@ -13,16 +13,21 @@ set -uo pipefail
 DIR=/mnt/c/Users/joshr/Documents/solsnipe
 BIN=/home/josh/.cargo-target/solsnipe/release/solsnipe
 SECS="${1:-3600}"
+CFG="${2:-config.toml}"
+TAG="${3:-}"
 
 cd "$DIR" || exit 1
-rm -f "$DIR/journal.jsonl" "$DIR/run.log"
+JOURNAL="$DIR/journal${TAG}.jsonl"
+LOG="$DIR/run${TAG}.log"
+rm -f "$JOURNAL" "$LOG"
 
-nohup env RUST_LOG=solsnipe=info timeout "$SECS" "$BIN" run > "$DIR/run.log" 2>&1 &
+nohup env RUST_LOG=solsnipe=info timeout "$SECS" "$BIN" --config "$DIR/$CFG" --journal "$JOURNAL" run > "$LOG" 2>&1 &
 PID=$!
 sleep 10
 
 echo "started pid $PID for ${SECS}s"
-echo "log:     $DIR/run.log"
-echo "journal: $DIR/journal.jsonl"
+echo "config:  $CFG"
+echo "log:     $LOG"
+echo "journal: $JOURNAL"
 echo "--- first output ---"
-tail -6 "$DIR/run.log"
+tail -6 "$LOG"
