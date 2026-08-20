@@ -1,0 +1,58 @@
+
+==================================================================
+ solsnipe report: run-4pos-baseline.jsonl
+==================================================================
+
+ FUNNEL
+   launches detected      660  100.0%  ############################
+   screened               652   98.8%  ############################
+   approved                18    2.7%  #
+   entered                  8    1.2%  
+   closed                   4    0.6%  
+
+   4 position(s) STILL OPEN and excluded from PnL below.
+   Losers hit their stop in seconds; winners need minutes to reach a
+   take-profit rung. Mid-run PnL is therefore biased pessimistic.
+
+ REJECTED (the screening working)
+   holder_count         470  ####################
+   concentration        147  ######
+   sell_route             2  
+   depth                  1  
+
+ COULD NOT CHECK (your endpoint, not the tokens)
+   buy_route            137  ######
+   sell_route             1  
+   holders                1  
+   mint_account           1  
+   -> 21% of screens were degraded. Fix the endpoint before
+      drawing any conclusion from the numbers below.
+
+ APPROVED BUT NOT TAKEN (risk gates)
+   at max concurrent positions (4)    7
+
+ BY VENUE
+   pump_fun          624 detected     7 entered
+   pump_swap          34 detected     1 entered
+   raydium_cpmm        2 detected     0 entered
+
+ CLOSED TRADES (4)
+   net PnL          -0.2636 SOL
+   win rate         25.0%  (1 win / 3 loss)
+   average          -0.0659 SOL
+   best             +0.2469 SOL
+   worst            -0.2510 SOL
+   avg win          +0.2469 SOL
+   avg loss         -0.1702 SOL
+   win/loss ratio   1.45x
+   -> sniping is normally low-win-rate and fat-tailed. A small
+      win rate with a large ratio is a working strategy; a high
+      win rate with a ratio under 1 means the losers are too big.
+
+ EXIT REASONS
+   stop_loss           2  ##############
+   unroutable          1  #######
+   take_profit         1  #######
+
+ PARTIAL EXITS: 4 (take-profit rungs firing before full close)
+

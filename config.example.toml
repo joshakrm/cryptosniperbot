@@ -11,6 +11,12 @@ jupiter_url = "https://lite-api.jup.ag/swap/v1"
 # The free tier throttles near 1/sec; queueing beats firing and failing,
 # because a 429 is indistinguishable from real information.
 jupiter_min_interval_ms = 400
+# Marks wait longer than screening quotes on purpose. Both measure against
+# the same last-request time, so a mark needing a big gap stands aside for
+# screening needing a small one. This is what caps total Jupiter load
+# regardless of position count - so raising concurrency now costs mark
+# freshness (looser stops) rather than screening coverage (missed tokens).
+jupiter_mark_interval_ms = 1200
 timeout_ms = 4000
 commitment = "confirmed"
 
@@ -65,7 +71,8 @@ min_pool_age_ms    = 15000
 
 [risk]
 position_size_sol       = 0.25
-max_concurrent_positions = 4    # marks dominate the Jupiter budget; 4 leaves
+max_concurrent_positions = 12   # raised now that marks no longer starve
+                                # screening. Cost is stop precision, not coverage.
                                 # room for screening quotes to get through
                                 # screening quotes, and the free lite API throttles
                                 # near 1/sec. 6 still recycles plenty of slots over

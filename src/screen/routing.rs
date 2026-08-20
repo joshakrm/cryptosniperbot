@@ -2,7 +2,7 @@ use tracing::debug;
 
 use super::MintFacts;
 use crate::config::ScreenConfig;
-use crate::rpc::{raw_to_ui, Jupiter};
+use crate::rpc::{raw_to_ui, Jupiter, Priority};
 use crate::types::{CheckResult, Pubkey, LAMPORTS_PER_SOL};
 
 /// Price impact above this on the depth probe means the pool cannot absorb the
@@ -40,7 +40,7 @@ pub async fn check(
     }
 
     // --- buy leg, at the size we would really trade ----------------------
-    let buy = match jup.quote(wsol, mint, entry_lamports, 500).await {
+    let buy = match jup.quote(wsol, mint, entry_lamports, 500, Priority::Screening).await {
         Ok(Some(q)) => q,
         Ok(None) => {
             out.push(CheckResult::fail(
@@ -85,7 +85,7 @@ pub async fn check(
     ));
 
     // --- sell leg: the honeypot test -------------------------------------
-    let sell = match jup.quote(mint, wsol, buy.out_amount, 500).await {
+    let sell = match jup.quote(mint, wsol, buy.out_amount, 500, Priority::Screening).await {
         Ok(Some(q)) => q,
         Ok(None) => {
             out.push(CheckResult::fail(
@@ -127,7 +127,7 @@ pub async fn check(
     // it without extreme impact is a pool you cannot exit at size, no matter
     // what its headline TVL says.
     let depth_lamports = (cfg.min_liquidity_sol * LAMPORTS_PER_SOL) as u64;
-    match jup.quote(wsol, mint, depth_lamports, 500).await {
+    match jup.quote(wsol, mint, depth_lamports, 500, Priority::Screening).await {
         Ok(Some(q)) if q.price_impact_pct <= MAX_DEPTH_PROBE_IMPACT => {
             out.push(CheckResult::pass(
                 "depth",

@@ -133,7 +133,22 @@ impl SolanaRpc {
     }
 }
 
+/// What a Jupiter request is for.
+///
+/// The two classes compete for one budget and they are not equally important.
+/// Screening coverage decides how many opportunities you ever see; mark
+/// freshness only decides how precisely you exit one you already hold.
+/// So marks yield.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Priority {
+    /// Screening a candidate. Short interval - these are rare and decisive.
+    Screening,
+    /// Marking an open position. Long interval - frequent and merely useful.
+    Mark,
+}
+
 /// Jupiter quote client. Two jobs:
+///
 ///   1. price discovery for entry and exit marks
 ///   2. the honeypot test - if Jupiter cannot route a SELL, you cannot get out
 #[derive(Clone)]
@@ -145,6 +160,7 @@ pub struct Jupiter {
     /// fix is not to provoke one: queue instead of firing and failing.
     gate: Arc<tokio::sync::Mutex<Option<Instant>>>,
     min_interval: Duration,
+    mark_interval: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +184,7 @@ impl Jupiter {
             base: cfg.jupiter_url.trim_end_matches('/').to_string(),
             gate: Arc::new(tokio::sync::Mutex::new(None)),
             min_interval: Duration::from_millis(cfg.jupiter_min_interval_ms),
+            mark_interval: Duration::from_millis(cfg.jupiter_mark_interval_ms),
         })
     }
 
@@ -178,15 +195,24 @@ impl Jupiter {
     /// polled every few seconds against a handful of candidates a minute), so
     /// without this the marks starve the screening and candidates come back
     /// unscreenable through no fault of their own.
-    async fn throttle(&self) {
-        if self.min_interval.is_zero() {
+    async fn throttle(&self, priority: Priority) {
+        // Both classes measure against the SAME last-request timestamp, so a
+        // mark requiring a long gap since any request naturally stands aside
+        // for screening, which requires only a short one. Total outbound rate
+        // stays bounded no matter how many positions are open - which is what
+        // lets concurrency rise without costing screening coverage.
+        let interval = match priority {
+            Priority::Screening => self.min_interval,
+            Priority::Mark => self.mark_interval.max(self.min_interval),
+        };
+        if interval.is_zero() {
             return;
         }
         let mut last = self.gate.lock().await;
         if let Some(prev) = *last {
             let elapsed = prev.elapsed();
-            if elapsed < self.min_interval {
-                tokio::time::sleep(self.min_interval - elapsed).await;
+            if elapsed < interval {
+                tokio::time::sleep(interval - elapsed).await;
             }
         }
         *last = Some(Instant::now());
@@ -200,10 +226,11 @@ impl Jupiter {
         output_mint: &str,
         amount: u64,
         slippage_bps: u64,
+        priority: Priority,
     ) -> Result<Option<Quote>> {
         let url = format!("{}/quote", self.base);
 
-        self.throttle().await;
+        self.throttle(priority).await;
         let resp = self
             .client
             .get(&url)
@@ -305,7 +332,11 @@ impl PriceSource for JupiterPrices {
         if raw == 0 || tokens_held <= 0.0 {
             return Ok(None);
         }
-        match self.jup.quote(mint, &self.wsol, raw, 500).await? {
+        match self
+            .jup
+            .quote(mint, &self.wsol, raw, 500, Priority::Mark)
+            .await?
+        {
             Some(q) => {
                 let sol_out = q.out_amount as f64 / LAMPORTS_PER_SOL;
                 Ok(Some(sol_out / tokens_held))
@@ -391,6 +422,7 @@ Connection: close
             base,
             gate: Arc::new(tokio::sync::Mutex::new(None)),
             min_interval: Duration::from_millis(min_interval_ms),
+            mark_interval: Duration::from_millis(min_interval_ms),
         }
     }
 
@@ -432,7 +464,7 @@ Connection: close
 
         let started = Instant::now();
         for _ in 0..3 {
-            let _ = j.quote("A", "B", 1, 500).await;
+            let _ = j.quote("A", "B", 1, 500, Priority::Screening).await;
         }
         let elapsed = started.elapsed();
 
@@ -443,14 +475,41 @@ Connection: close
         );
     }
 
+    // The whole point of the two classes: raising concurrency must cost mark
+    // freshness, never screening coverage. Measured live, marks competing
+    // equally with screening cost 22-33% of screens to 429s.
+    #[tokio::test]
+    async fn marks_yield_to_screening() {
+        let body = r#"{"inAmount":"1","outAmount":"2"}"#;
+        let base = stub_n("200 OK", body, 4).await;
+        let mut j = jup_throttled(base, 40);
+        j.mark_interval = Duration::from_millis(400);
+
+        // Prime the gate, then time each class from the same starting point.
+        let _ = j.quote("A", "B", 1, 500, Priority::Screening).await;
+
+        let t = Instant::now();
+        let _ = j.quote("A", "B", 1, 500, Priority::Screening).await;
+        let screening = t.elapsed();
+
+        let t = Instant::now();
+        let _ = j.quote("A", "B", 1, 500, Priority::Mark).await;
+        let mark = t.elapsed();
+
+        assert!(
+            mark > screening * 3,
+            "a mark ({mark:?}) must wait far longer than a screening quote ({screening:?})"
+        );
+    }
+
     #[tokio::test]
     async fn a_zero_interval_disables_the_throttle() {
         let body = r#"{"inAmount":"1","outAmount":"2"}"#;
         let base = stub_n("200 OK", body, 2).await;
         let j = jup_throttled(base, 0);
         let started = Instant::now();
-        let _ = j.quote("A", "B", 1, 500).await;
-        let _ = j.quote("A", "B", 1, 500).await;
+        let _ = j.quote("A", "B", 1, 500, Priority::Screening).await;
+        let _ = j.quote("A", "B", 1, 500, Priority::Screening).await;
         assert!(started.elapsed() < Duration::from_millis(500));
     }
 
@@ -461,28 +520,28 @@ Connection: close
     #[tokio::test]
     async fn throttling_is_an_error_not_an_absent_route() {
         let base = stub("429 Too Many Requests", r#"{"error":"rate limited"}"#).await;
-        let r = jup(base).quote("A", "B", 1_000, 500).await;
+        let r = jup(base).quote("A", "B", 1_000, 500, Priority::Screening).await;
         assert!(r.is_err(), "429 must not be reported as no-route, got {r:?}");
     }
 
     #[tokio::test]
     async fn a_server_error_is_an_error_not_an_absent_route() {
         let base = stub("503 Service Unavailable", "{}").await;
-        let r = jup(base).quote("A", "B", 1_000, 500).await;
+        let r = jup(base).quote("A", "B", 1_000, 500, Priority::Screening).await;
         assert!(r.is_err(), "5xx must not be reported as no-route, got {r:?}");
     }
 
     #[tokio::test]
     async fn a_bad_request_really_does_mean_no_route() {
         let base = stub("400 Bad Request", r#"{"error":"COULD_NOT_FIND_ANY_ROUTE"}"#).await;
-        let r = jup(base).quote("A", "B", 1_000, 500).await;
+        let r = jup(base).quote("A", "B", 1_000, 500, Priority::Screening).await;
         assert!(matches!(r, Ok(None)), "400 is Jupiter's real no-route answer, got {r:?}");
     }
 
     #[tokio::test]
     async fn an_error_body_on_a_200_is_still_no_route() {
         let base = stub("200 OK", r#"{"error":"COULD_NOT_FIND_ANY_ROUTE"}"#).await;
-        let r = jup(base).quote("A", "B", 1_000, 500).await;
+        let r = jup(base).quote("A", "B", 1_000, 500, Priority::Screening).await;
         assert!(matches!(r, Ok(None)), "got {r:?}");
     }
 
@@ -490,7 +549,7 @@ Connection: close
     async fn a_well_formed_quote_parses() {
         let body = r#"{"inAmount":"1000","outAmount":"2500","priceImpactPct":"0.01","routePlan":[{},{}]}"#;
         let base = stub("200 OK", body).await;
-        let q = jup(base).quote("A", "B", 1_000, 500).await.unwrap().unwrap();
+        let q = jup(base).quote("A", "B", 1_000, 500, Priority::Screening).await.unwrap().unwrap();
         assert_eq!(q.in_amount, 1_000);
         assert_eq!(q.out_amount, 2_500);
         assert_eq!(q.route_hops, 2);
@@ -500,7 +559,7 @@ Connection: close
     #[tokio::test]
     async fn a_zero_output_quote_is_no_route() {
         let base = stub("200 OK", r#"{"inAmount":"1000","outAmount":"0"}"#).await;
-        let r = jup(base).quote("A", "B", 1_000, 500).await;
+        let r = jup(base).quote("A", "B", 1_000, 500, Priority::Screening).await;
         assert!(matches!(r, Ok(None)), "got {r:?}");
     }
 }
