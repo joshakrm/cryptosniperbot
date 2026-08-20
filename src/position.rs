@@ -271,6 +271,7 @@ impl PositionManager {
 
         let mut closed = false;
         let mut pnl = 0.0;
+        let mut peak = pos.peak_price_sol;
 
         {
             let mut map = self.positions.lock().await;
@@ -288,6 +289,7 @@ impl PositionManager {
                 let residual_sol = p.tokens_held * fill.price_sol;
                 if p.tokens_held <= 0.0 || residual_sol <= self.cfg.dust_value_sol {
                     closed = true;
+                    peak = p.peak_price_sol;
                     // Marked at zero, not at the last fill price: we are walking
                     // away from this residual and will never realise it. Booking
                     // it at a price we decline to trade at would inflate every
@@ -303,10 +305,25 @@ impl PositionManager {
 
         if closed {
             info!(mint = %pos.mint, pnl_sol = pnl, ?reason, "position closed");
+            // Peak is recorded so the exit thresholds can be checked against
+            // what actually happened. Without it there is no way to tell a
+            // take-profit rung that is set too high from a token that simply
+            // never moved - they look identical in the PnL.
+            let peak_bps = if pos.entry_price_sol > 0.0 {
+                (((peak / pos.entry_price_sol) - 1.0) * 10_000.0) as i64
+            } else {
+                0
+            };
             self.journal
                 .write(
                     "position_close",
-                    json!({ "mint": pos.mint, "reason": reason, "pnl_sol": pnl }),
+                    json!({
+                        "mint": pos.mint,
+                        "reason": reason,
+                        "pnl_sol": pnl,
+                        "peak_price_sol": peak,
+                        "max_gain_bps": peak_bps,
+                    }),
                 )
                 .await;
             self.risk.record_exit(pnl, true).await;
@@ -322,10 +339,21 @@ impl PositionManager {
         let removed = { self.positions.lock().await.remove(mint) };
         if let Some(p) = removed {
             let pnl = p.pnl_sol(price);
+            let peak_bps = if p.entry_price_sol > 0.0 {
+                (((p.peak_price_sol / p.entry_price_sol) - 1.0) * 10_000.0) as i64
+            } else {
+                0
+            };
             self.journal
                 .write(
                     "position_close",
-                    json!({ "mint": mint, "reason": reason, "pnl_sol": pnl }),
+                    json!({
+                        "mint": mint,
+                        "reason": reason,
+                        "pnl_sol": pnl,
+                        "peak_price_sol": p.peak_price_sol,
+                        "max_gain_bps": peak_bps,
+                    }),
                 )
                 .await;
             self.risk.record_exit(pnl, true).await;
