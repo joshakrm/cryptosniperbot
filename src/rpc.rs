@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::config::RpcConfig;
 use crate::types::{Pubkey, LAMPORTS_PER_SOL};
@@ -80,12 +81,47 @@ impl SolanaRpc {
         .await
     }
 
+    /// Largest holders, with a retry for the index lag at t=0.
+    ///
+    /// A freshly launched mint is visible to getAccountInfo before it is
+    /// visible to this method: the node answers authority queries happily while
+    /// still reporting "Invalid param: not a Token mint" here for roughly a
+    /// second. Observed live on 33 of 34 pump.fun launches, every one of which
+    /// resolved normally moments later.
+    ///
+    /// Retrying only this specific error beats delaying every candidate,
+    /// because most of the time the first attempt already works, and a sniper
+    /// pays for every millisecond it waits.
     pub async fn get_token_largest_accounts(&self, mint: &Pubkey) -> Result<Value> {
-        self.call(
-            "getTokenLargestAccounts",
-            json!([mint, { "commitment": self.commitment }]),
-        )
-        .await
+        const ATTEMPTS: u32 = 4;
+        let mut last: Option<anyhow::Error> = None;
+
+        for attempt in 0..ATTEMPTS {
+            let result = self
+                .call(
+                    "getTokenLargestAccounts",
+                    json!([mint, { "commitment": self.commitment }]),
+                )
+                .await;
+
+            match result {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    // Anything else is a real failure and must not be masked by
+                    // retries - fail fast so it shows up as unavailable.
+                    if !e.to_string().contains("not a Token mint") {
+                        return Err(e);
+                    }
+                    last = Some(e);
+                }
+            }
+
+            if attempt + 1 < ATTEMPTS {
+                tokio::time::sleep(Duration::from_millis(300 * (attempt as u64 + 1))).await;
+            }
+        }
+
+        Err(last.unwrap_or_else(|| anyhow!("getTokenLargestAccounts never became available")))
     }
 
     pub async fn get_token_supply(&self, mint: &Pubkey) -> Result<Value> {
@@ -104,6 +140,11 @@ impl SolanaRpc {
 pub struct Jupiter {
     client: reqwest::Client,
     base: String,
+    /// Shared across every clone, so screening quotes and position marks draw
+    /// from ONE budget. A 429 tells us nothing about a token, so the cheapest
+    /// fix is not to provoke one: queue instead of firing and failing.
+    gate: Arc<tokio::sync::Mutex<Option<Instant>>>,
+    min_interval: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -125,7 +166,30 @@ impl Jupiter {
         Ok(Self {
             client,
             base: cfg.jupiter_url.trim_end_matches('/').to_string(),
+            gate: Arc::new(tokio::sync::Mutex::new(None)),
+            min_interval: Duration::from_millis(cfg.jupiter_min_interval_ms),
         })
+    }
+
+    /// Wait until we are allowed to make another request.
+    ///
+    /// The lock is deliberately held across the sleep: that is what serialises
+    /// callers. Position marks vastly outnumber screening quotes (six positions
+    /// polled every few seconds against a handful of candidates a minute), so
+    /// without this the marks starve the screening and candidates come back
+    /// unscreenable through no fault of their own.
+    async fn throttle(&self) {
+        if self.min_interval.is_zero() {
+            return;
+        }
+        let mut last = self.gate.lock().await;
+        if let Some(prev) = *last {
+            let elapsed = prev.elapsed();
+            if elapsed < self.min_interval {
+                tokio::time::sleep(self.min_interval - elapsed).await;
+            }
+        }
+        *last = Some(Instant::now());
     }
 
     /// Returns Ok(None) when Jupiter has no route at all - which for a sell is
@@ -138,6 +202,8 @@ impl Jupiter {
         slippage_bps: u64,
     ) -> Result<Option<Quote>> {
         let url = format!("{}/quote", self.base);
+
+        self.throttle().await;
         let resp = self
             .client
             .get(&url)
@@ -316,7 +382,76 @@ Connection: close
     }
 
     fn jup(base: String) -> Jupiter {
-        Jupiter { client: reqwest::Client::new(), base }
+        jup_throttled(base, 0)
+    }
+
+    fn jup_throttled(base: String, min_interval_ms: u64) -> Jupiter {
+        Jupiter {
+            client: reqwest::Client::new(),
+            base,
+            gate: Arc::new(tokio::sync::Mutex::new(None)),
+            min_interval: Duration::from_millis(min_interval_ms),
+        }
+    }
+
+    /// Serve `n` sequential requests from one listener.
+    async fn stub_n(status_line: &'static str, body: &'static str, n: usize) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..n {
+                if let Ok((mut sock, _)) = listener.accept().await {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 {status_line}
+Content-Type: application/json
+Content-Length: {}
+Connection: close
+
+{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                }
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    // Position marks vastly outnumber screening quotes, so without a shared
+    // budget the marks starve the screening and candidates come back
+    // unscreenable. Observed live: 33% of screens degraded by 429s.
+    #[tokio::test]
+    async fn requests_are_spaced_by_the_configured_interval() {
+        let body = r#"{"inAmount":"1","outAmount":"2"}"#;
+        let base = stub_n("200 OK", body, 3).await;
+        let j = jup_throttled(base, 120);
+
+        let started = Instant::now();
+        for _ in 0..3 {
+            let _ = j.quote("A", "B", 1, 500).await;
+        }
+        let elapsed = started.elapsed();
+
+        // Three requests at 120ms spacing cannot finish faster than 240ms.
+        assert!(
+            elapsed >= Duration::from_millis(220),
+            "three throttled requests took only {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_interval_disables_the_throttle() {
+        let body = r#"{"inAmount":"1","outAmount":"2"}"#;
+        let base = stub_n("200 OK", body, 2).await;
+        let j = jup_throttled(base, 0);
+        let started = Instant::now();
+        let _ = j.quote("A", "B", 1, 500).await;
+        let _ = j.quote("A", "B", 1, 500).await;
+        assert!(started.elapsed() < Duration::from_millis(500));
     }
 
     // REGRESSION: every non-2xx status collapsed into Ok(None) "no route". A

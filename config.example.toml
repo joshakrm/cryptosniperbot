@@ -7,6 +7,10 @@
 http_url  = "https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"
 ws_url    = "wss://mainnet.helius-rpc.com/?api-key=YOUR_KEY"
 jupiter_url = "https://lite-api.jup.ag/swap/v1"
+# Minimum gap between Jupiter requests, shared by screening and marks.
+# The free tier throttles near 1/sec; queueing beats firing and failing,
+# because a 429 is indistinguishable from real information.
+jupiter_min_interval_ms = 400
 timeout_ms = 4000
 commitment = "confirmed"
 
@@ -26,7 +30,12 @@ watch = ["pump_fun", "raydium_amm_v4", "raydium_cpmm", "pump_swap"]
 # Every check FAILS CLOSED: if we cannot determine the answer, we reject.
 min_liquidity_sol  = 5.0     # reject thin pools you cannot exit
 max_top10_pct      = 65.0    # reject if top 10 non-pool holders own more than this
-min_holders        = 15
+min_holders        = 5      # of the ~20 the RPC returns. The measured
+                            # distribution is bimodal: most launches sit at
+                            # 1-3 holders and a second cluster at 10-20, with
+                            # almost nothing between. So 5 only admits ~5pp
+                            # more than 10 did; 3 is the next real step down.
+                            # so this deliberately keeps only tokens with traction
 require_mint_authority_renounced   = true   # else dev can print infinite supply
 require_freeze_authority_renounced = true   # else dev can freeze your token account
 reject_token2022_extensions = true          # transfer hooks / fees / permanent delegate
@@ -40,14 +49,27 @@ max_screen_ms      = 8000                   # give up on a candidate after this
 # you deliberately want to trade through a flaky endpoint, and expect worse
 # selection when you do.
 treat_unavailable_as = "reject"
-min_pool_age_ms    = 0                      # optional deliberate delay before screening
+# MEASURED, not guessed: over 73 live launches the Helius token-account index
+# lagged the mint by a median of 13.0s and a max of 16.3s. getAccountInfo
+# answers instantly, but getTokenLargestAccounts reports "not a Token mint"
+# until the index catches up, so screening any sooner cannot see holders at
+# all. The retry in rpc.rs covers the tail beyond this delay.
+min_pool_age_ms    = 15000
 
 [risk]
 position_size_sol       = 0.25
-max_concurrent_positions = 3
+max_concurrent_positions = 4    # marks dominate the Jupiter budget; 4 leaves
+                                # room for screening quotes to get through
+                                # screening quotes, and the free lite API throttles
+                                # near 1/sec. 6 still recycles plenty of slots over
+                                # an hour since stops fire fast.
+                                # full for 15 min, so 3 capped the bot at ~3 entries
+                                # per quarter hour regardless of how many tokens
+                                # passed screening. Raised for paper data gathering;
+                                # drop it back before ever going live.
 max_daily_loss_sol      = 2.0
 max_trades_per_day      = 40
-cooldown_ms             = 3000   # min gap between entries
+cooldown_ms             = 1500   # was 3000, which blocked 2 of 9 approvals
 kill_switch_file        = "KILL" # create this file to halt all entries immediately
 
 [exit]
@@ -61,7 +83,12 @@ take_profit = [
 stop_loss_bps     = 3500   # -35%
 trailing_stop_bps = 2500   # give back 25% from peak
 max_hold_secs     = 900    # hard timeout, 15 min
-poll_interval_ms  = 2000
+poll_interval_ms  = 5000   # 4 positions / 5s = 0.8 marks/sec, leaving budget
+                           # for screening. Wider sweeps mean worse stop fills:
+                           # a real cost, paid to keep screening working.
+                           # gap, which is a real cost - the first closed trade
+                           # realised -72% against a -35% stop because a pump.fun
+                           # token can halve between sweeps.
 # Residual value below which we stop trying to sell. Denominated in SOL, not
 # token count: after a big run-up, 0.1% of the tokens is still real money.
 dust_value_sol    = 0.005
@@ -72,9 +99,13 @@ slippage_bps         = 300    # your realistic slippage on entry
 priority_fee_sol     = 0.001  # what you would actually pay per tx
 # THE HONEST KNOB. In a real snipe you are not first. By the time your tx lands
 # the price has already run. Set this from measured data, not hope. 0 = fantasy.
-latency_penalty_bps  = 1200
+latency_penalty_bps  = 500    # was 1200 when this raced for the first block.
+                              # Entry is now quoted at t+15s, so the launch move
+                              # is already IN the quote; this models only the
+                              # quote-to-fill gap. Re-derive from your journal.
 # Fraction of signals where your tx would actually have landed at all.
-fill_probability     = 0.55
+fill_probability     = 0.90   # was 0.55 when racing colocated bots at t=0.
+                              # At t+15s there is no race left to lose.
 
 [live]
 # Live execution is NOT implemented. This block exists so the config shape is

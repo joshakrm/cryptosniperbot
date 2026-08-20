@@ -23,7 +23,14 @@ pub struct RpcConfig {
     pub timeout_ms: u64,
     #[serde(default = "d_commitment")]
     pub commitment: String,
+    /// Minimum gap between outbound Jupiter requests, shared across screening
+    /// and position marks. The free aggregator tier throttles around 1/sec and
+    /// a 429 is indistinguishable from useful information, so it is better to
+    /// queue than to fire and fail. 0 disables the limiter.
+    #[serde(default = "d_jup_interval")]
+    pub jupiter_min_interval_ms: u64,
 }
+fn d_jup_interval() -> u64 { 250 }
 fn d_timeout() -> u64 { 4000 }
 fn d_commitment() -> String { "confirmed".to_string() }
 

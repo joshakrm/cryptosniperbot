@@ -317,6 +317,69 @@ was tightened. Without the mutation check that would have read as green.
 wsl -d Ubuntu -- bash -lc "cd /mnt/c/Users/joshr/Documents/solsnipe && python3 scripts/mutation_check.py"
 ```
 
+## What live traffic actually showed
+
+Numbers measured against mainnet, not estimated. They drive most of the defaults
+in `config.example.toml`, and none of them are recoverable by reading the code.
+
+### The token index lags launches by ~13 seconds
+
+Over 73 live launches, Helius answered `getAccountInfo` instantly but reported
+`Invalid param: not a Token mint` from `getTokenLargestAccounts` for a **median
+of 13.0s** (max 16.3s) after the launch transaction.
+
+That single fact reshapes the strategy. Screen any sooner and the holder checks
+cannot run at all — an early build rejected 96% of candidates as `unavailable`
+and looked, wrongly, like a wall of dangerous tokens. Hence
+`min_pool_age_ms = 15000`, plus a retry in `rpc.rs` for the tail.
+
+The consequence is worth stating plainly: **this is not a first-block sniper.**
+It enters ~15s after launch. On a home connection you were never going to win a
+block race against colocated bots anyway, so the honest play is to spend that
+time buying information instead.
+
+### Holder counts are bimodal
+
+Once indexed, launches cluster at **1–3 holders** or at **10–20**, with almost
+nothing between:
+
+```
+ 1 holder  ████████████████████████  24
+ 2         █████████████             13
+ 3         █████████                  9
+ 4-9       ██████                     6
+10-20      ████████████████          21
+```
+
+So `min_holders` is a coarse switch, not a dial. Moving it 10 → 5 changes the
+pass rate only 20% → 25%, because 5 sits in the empty middle. The meaningful
+settings are ~10 (only tokens with traction) or ~2 (nearly everything).
+
+### The aggregator is the real rate limit
+
+Position marks vastly outnumber screening quotes — six positions polled every
+few seconds is ~2 req/s against ~0.4 req/s of screening — so marks starve
+screening and candidates come back unscreenable through no fault of their own.
+At six concurrent positions, **33% of screens were degraded by HTTP 429**.
+
+`jupiter_min_interval_ms` serialises all Jupiter traffic through one shared
+budget so requests queue instead of failing. Queueing beats firing and failing,
+because a 429 carries no information about the token.
+
+### A stop loss sets the trigger, not the fill
+
+The first closed trade stopped out at −72% against a −35% stop. Nothing
+malfunctioned: a fresh pump.fun token can halve between sweeps. Tightening
+`poll_interval_ms` narrows that gap but spends Jupiter budget, which costs you
+screening. That trade-off is real and unavoidable on a free tier.
+
+### Read mid-run PnL with suspicion
+
+Losers hit their stop within seconds; winners need minutes to reach a
+take-profit rung or `max_hold_secs`. Any PnL sampled mid-run is therefore drawn
+from the worst end of the distribution. `scripts/report.py` excludes open
+positions and says so rather than quietly averaging them in.
+
 ## Known gaps
 
 Stated plainly, because a sniper you do not understand is a sniper that will
