@@ -87,6 +87,7 @@ impl PositionManager {
             peak_price_sol: entry_price,
             next_rung: 0,
             unroutable_strikes: 0,
+            last_price_sol: None,
         };
         self.journal.write_typed("position_open", &pos).await;
         self.positions.lock().await.insert(mint, pos);
@@ -117,29 +118,48 @@ impl PositionManager {
         for pos in snapshot {
             let price = match self.mark_price(&pos).await {
                 Mark::Price(p) if p > 0.0 => {
-                    if pos.unroutable_strikes > 0 {
-                        self.clear_strikes(&pos.mint).await;
-                    }
+                    self.record_mark(&pos.mint, p, pos.unroutable_strikes > 0).await;
                     p
                 }
                 // A zero price is as unsellable as no route at all.
                 Mark::Price(_) | Mark::NoRoute => {
                     let strikes = self.add_strike(&pos.mint).await;
                     if strikes >= UNROUTABLE_STRIKES {
+                        // Genuinely unsellable, so it really is worth zero.
                         warn!(
                             mint = %pos.mint,
                             strikes,
                             "no sell route on {UNROUTABLE_STRIKES} consecutive sweeps - writing off"
                         );
-                        self.force_close(&pos.mint, ExitReason::Unroutable).await;
+                        self.force_close(&pos.mint, 0.0, ExitReason::Unroutable).await;
                     } else {
                         warn!(mint = %pos.mint, strikes, "no sell route this sweep");
                     }
                     continue;
                 }
                 Mark::Unknown => {
-                    // Transport failure tells us nothing about the token. Acting
-                    // on it would let a Jupiter blip flatten the whole book.
+                    // A transport failure still tells us nothing about the
+                    // token, so no price-based rule may fire. But the CLOCK
+                    // keeps running, and simply skipping the position leaves it
+                    // open forever: it holds a risk slot and keeps spending mark
+                    // budget indefinitely.
+                    //
+                    // Measured: 10 positions held 58 minutes against a 15 minute
+                    // max_hold, and the budget they consumed starved screening
+                    // so completely that approvals went to zero for the last 50
+                    // minutes of a live hour. Unmanageable positions have to be
+                    // let go of.
+                    let age = (Utc::now() - pos.opened_at).num_seconds();
+                    if age >= self.cfg.max_hold_secs {
+                        let stale = pos.last_price_sol.unwrap_or(pos.entry_price_sol);
+                        warn!(
+                            mint = %pos.mint,
+                            age,
+                            stale_price = stale,
+                            "past max hold and unmarkable - closing at last observed price"
+                        );
+                        self.force_close(&pos.mint, stale, ExitReason::MaxHold).await;
+                    }
                     continue;
                 }
             };
@@ -181,10 +201,14 @@ impl PositionManager {
         }
     }
 
-    async fn clear_strikes(&self, mint: &str) {
+    /// Remember the last real price, and clear any accumulated strikes.
+    async fn record_mark(&self, mint: &str, price: f64, had_strikes: bool) {
         let mut map = self.positions.lock().await;
         if let Some(p) = map.get_mut(mint) {
-            p.unroutable_strikes = 0;
+            p.last_price_sol = Some(price);
+            if had_strikes {
+                p.unroutable_strikes = 0;
+            }
         }
     }
 
@@ -289,12 +313,15 @@ impl PositionManager {
         }
     }
 
-    /// Drop a position that has no sellable route left.
-    async fn force_close(&self, mint: &str, reason: ExitReason) {
+    /// Drop a position we can no longer manage, valued at `price`.
+    ///
+    /// Zero for a genuine rug, the last observed price for one we simply cannot
+    /// see any more. The second is a stale valuation and the journal records it
+    /// as such, but the alternative is holding the slot forever.
+    async fn force_close(&self, mint: &str, price: f64, reason: ExitReason) {
         let removed = { self.positions.lock().await.remove(mint) };
         if let Some(p) = removed {
-            // Nothing sellable, so the remaining tokens mark at zero.
-            let pnl = p.pnl_sol(0.0);
+            let pnl = p.pnl_sol(price);
             self.journal
                 .write(
                     "position_close",
@@ -393,6 +420,7 @@ mod tests {
             peak_price_sol: 1.0,
             next_rung: 0,
             unroutable_strikes: 0,
+            last_price_sol: None,
         }
     }
 
@@ -535,6 +563,56 @@ mod tests {
             1,
             "an outage is evidence about nothing and must not book a loss"
         );
+    }
+
+    // REGRESSION, measured live over a full hour: a Mark::Unknown used to skip
+    // evaluate() entirely, so max_hold never ran and the position was held
+    // forever. Ten positions sat open for 58 minutes against a 15 minute
+    // window, and the mark budget they burned starved screening so badly that
+    // approvals went to ZERO for the last 50 minutes of the run.
+    //
+    // Worth remembering that the adversarial review raised exactly this and the
+    // verifier refuted it. The traffic settled the argument.
+    #[tokio::test]
+    async fn an_unmarkable_position_is_released_after_max_hold() {
+        let (pm, risk) = harness(vec![None; 12]).await; // every mark fails
+        opened(&pm, &risk).await;
+
+        // Back-date it past the hold window, with one price previously seen.
+        {
+            let mut map = pm.positions.lock().await;
+            let p = map.values_mut().next().unwrap();
+            p.opened_at = Utc::now() - chrono::Duration::seconds(cfg().max_hold_secs + 1);
+            p.last_price_sol = Some(0.9);
+        }
+
+        pm.sweep().await.unwrap();
+
+        assert_eq!(
+            pm.open_count().await,
+            0,
+            "a position we cannot manage must not be held indefinitely"
+        );
+        let (_, pnl, open) = risk.snapshot().await;
+        assert_eq!(open, 0, "the risk slot has to come back");
+        // Valued at the last price actually observed: 1000 * 0.9 - 1000 in.
+        assert!((pnl + 100.0).abs() < 1e-6, "pnl was {pnl}");
+    }
+
+    #[tokio::test]
+    async fn an_unmarkable_position_falls_back_to_entry_price_if_never_marked() {
+        let (pm, risk) = harness(vec![None; 12]).await;
+        opened(&pm, &risk).await;
+        {
+            let mut map = pm.positions.lock().await;
+            let p = map.values_mut().next().unwrap();
+            p.opened_at = Utc::now() - chrono::Duration::seconds(cfg().max_hold_secs + 1);
+            // last_price_sol stays None: never successfully marked.
+        }
+        pm.sweep().await.unwrap();
+        assert_eq!(pm.open_count().await, 0);
+        let (_, pnl, _) = risk.snapshot().await;
+        assert!((pnl).abs() < 1e-6, "entry-priced close should be flat, got {pnl}");
     }
 
     #[tokio::test]

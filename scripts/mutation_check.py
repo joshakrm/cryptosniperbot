@@ -123,6 +123,15 @@ MUTATIONS = [
         "        let doubled = t.interval;",
         "being_throttled_widens_the_interval",
     ),
+    (
+        "unmarkable positions skipped entirely, so max_hold never runs",
+        "src/position.rs",
+        "                    let age = (Utc::now() - pos.opened_at).num_seconds();" + LF
+        + "                    if age >= self.cfg.max_hold_secs {",
+        "                    let age = (Utc::now() - pos.opened_at).num_seconds();" + LF
+        + "                    if false && age >= self.cfg.max_hold_secs {",
+        "an_unmarkable_position_is_released_after_max_hold",
+    ),
 ]
 
 

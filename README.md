@@ -401,6 +401,38 @@ malfunctioned: a fresh pump.fun token can halve between sweeps. Tightening
 `poll_interval_ms` narrows that gap but spends Jupiter budget, which costs you
 screening. That trade-off is real and unavoidable on a free tier.
 
+### A position you cannot mark is a position you cannot manage
+
+The worst bug found so far, and it only appeared over a full hour.
+
+`Mark::Unknown` (a transport failure) correctly refuses to fire any price-based
+rule — but it used to skip `evaluate()` altogether, so the **clock-based** rule
+never ran either. A position whose marks kept failing was held forever.
+
+Measured: 10 positions open for 58 minutes against a 15-minute `max_hold_secs`.
+And it cascaded. Those positions kept consuming mark budget indefinitely, which
+starved screening, which took approvals from 16 in the first ten minutes to
+**zero across the following 1,672 screens**:
+
+```
+ +0-10m   screened 329   approved 16   degraded 20%
++10-20m   screened 293   approved  0   degraded 26%
+...
++40-50m   screened 386   approved  0   degraded 35%
+```
+
+An hour of runtime produced 14 entries, all in the first 140 seconds.
+
+Positions past their hold window that still cannot be marked are now closed at
+the last price actually observed — a stale valuation, recorded as such, but the
+alternative is holding a risk slot and burning budget forever.
+
+Worth recording how this was found: the adversarial review raised it and the
+verify stage **refuted** it. The refutation was wrong and the live traffic
+settled it. Adversarial verification cuts false positives, and it will
+occasionally cut a true one — a reason to keep running the thing against reality
+rather than treating a clean review as proof.
+
 ### Read mid-run PnL with suspicion
 
 Losers hit their stop within seconds; winners need minutes to reach a

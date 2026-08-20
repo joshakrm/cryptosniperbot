@@ -174,6 +174,10 @@ pub struct Position {
     /// hiccup at the aggregator look identical on any single sweep, so we
     /// require repeated confirmation before writing a position off.
     pub unroutable_strikes: u8,
+    /// The last price we actually observed. Used to value a position that has
+    /// outlived its hold window while unmarkable - a stale number, but a real
+    /// one, and better than holding a slot forever.
+    pub last_price_sol: Option<f64>,
 }
 
 impl Position {
@@ -216,6 +220,7 @@ mod tests {
             peak_price_sol: 1.0,
             next_rung: 0,
             unroutable_strikes: 0,
+            last_price_sol: None,
         }
     }
 
