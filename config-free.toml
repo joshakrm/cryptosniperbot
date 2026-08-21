@@ -1,11 +1,28 @@
+# FREE-INFRASTRUCTURE CONFIG - no API key, no signup, no account.
+#
+# publicnode serves getTransaction, getAccountInfo and getTokenSupply at ~5
+# calls/sec with websockets included. The one method it refuses is
+# getTokenLargestAccounts (HTTP 403), which feeds the holder checks - and those
+# need a 15s wait for the token index anyway, which was measured over 31 trades
+# and does not work.
+#
+# So the free tier and the fast-entry strategy want exactly the same thing.
+# Jupiter remains the real constraint; see jupiter_* below.
+
+# Local config - NOT committed (gitignored, verified untracked).
+#
+# Paste your Helius key over BOTH occurrences of YOUR_KEY_HERE below.
+# The program refuses to start while the placeholder is still present, so a
+# half-edited config fails loudly instead of silently using a broken endpoint.
+
 # solsnipe configuration
 # Copy to config.toml and fill in your RPC endpoints. config.toml is gitignored.
 
 [rpc]
 # A public RPC will rate-limit you into uselessness. Get a free key from
 # Helius / QuickNode / Triton and paste the URLs here.
-http_url  = "https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"
-ws_url    = "wss://mainnet.helius-rpc.com/?api-key=YOUR_KEY"
+http_url  = "https://solana-rpc.publicnode.com"
+ws_url    = "wss://solana-rpc.publicnode.com"
 jupiter_url = "https://lite-api.jup.ag/swap/v1"
 # Minimum gap between Jupiter requests, shared by screening and marks.
 # The free tier throttles near 1/sec; queueing beats firing and failing,
@@ -18,7 +35,7 @@ jupiter_min_interval_ms = 400
 jupiter_max_interval_ms  = 2500   # slowest it will back off to; 3 quotes at
                                   # this rate must fit inside max_screen_ms
 jupiter_mark_multiplier  = 3      # marks wait 3x a screening quote
-timeout_ms = 4000
+timeout_ms = 5000
 commitment = "confirmed"
 
 [programs]
@@ -57,25 +74,20 @@ require_lp_burned  = true
 # launch transaction that is fetched anyway. Measured over 225 live launches -
 # median pool 0.58 SOL - a 2.0 floor rejects 62% of candidates before they can
 # spend a single aggregator quote. Set 0.0 to disable.
-min_pool_sol       = 0.0
+min_pool_sol       = 2.0
+require_holders    = false  # cannot run this early; see header
 max_roundtrip_loss_bps = 1500               # buy+sell round trip via Jupiter, 15%
                                             # quoted at risk.position_size_sol, the size
                                             # you actually trade - impact is size-dependent
 max_screen_ms      = 15000  # must exceed 3 x jupiter_max_interval_ms, or
                             # screening times out exactly when the throttle
                             # backs off. Validated at startup.
-# What to do when a check cannot RUN (rpc error, timeout, throttling) as opposed
-# to running and failing. "reject" is the default and the safe answer: an
-# unanswered question about safety is not a safe answer. Set "advisory" only if
-# you deliberately want to trade through a flaky endpoint, and expect worse
-# selection when you do.
-treat_unavailable_as = "reject"
 # MEASURED, not guessed: over 73 live launches the Helius token-account index
 # lagged the mint by a median of 13.0s and a max of 16.3s. getAccountInfo
 # answers instantly, but getTokenLargestAccounts reports "not a Token mint"
 # until the index catches up, so screening any sooner cannot see holders at
 # all. The retry in rpc.rs covers the tail beyond this delay.
-min_pool_age_ms    = 15000
+min_pool_age_ms    = 0      # enter immediately; the whole point of the test
 
 [risk]
 position_size_sol       = 0.25

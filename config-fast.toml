@@ -72,6 +72,11 @@ reject_token2022_extensions = true          # transfer hooks / fees / permanent 
 # genuinely discriminates. Also rejects locker-held LP, which is the
 # fail-closed direction; see src/screen/liquidity.rs.
 require_lp_burned  = true
+# FREE gate, and the only one that costs nothing: the figure comes out of the
+# launch transaction that is fetched anyway. Measured over 225 live launches -
+# median pool 0.58 SOL - a 2.0 floor rejects 62% of candidates before they can
+# spend a single aggregator quote. Set 0.0 to disable.
+min_pool_sol       = 2.0
 require_holders    = false  # cannot run this early; see header
 max_roundtrip_loss_bps = 1500               # buy+sell round trip via Jupiter, 15%
                                             # quoted at risk.position_size_sol, the size

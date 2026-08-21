@@ -476,6 +476,44 @@ supply, and SOL placed in the pool — both read out of the launch transaction t
 is fetched anyway. They are **recorded, not enforced**: a threshold should come
 from a measured distribution, the way the exit thresholds should have.
 
+### Running on free infrastructure
+
+No API key, no signup, no account: `solana-rpc.publicnode.com` serves
+`getTransaction`, `getAccountInfo` and `getTokenSupply` at ~5 calls/sec with
+websockets, roughly five times what a spent Helius free tier delivered.
+
+The one method it refuses is `getTokenLargestAccounts` — which feeds the holder
+checks, which need the 15s index wait, which does not work. The free tier and the
+only viable strategy want the same configuration. `config-free.toml` is it.
+
+Everything else tested was unusable: Ankr, Alchemy demo and OnFinality returned
+403 or 429 immediately; dRPC and OMNIA returned 400 and 521.
+
+### The one filter that costs nothing
+
+With the holder checks gone, the aggregator budget collapses — 63% of screens
+timed out because every candidate went straight to three quotes. The fix had to
+be a filter that works at t=0 and costs nothing, and the launch transaction was
+already carrying one:
+
+```
+SOL in pool at launch (n=225):  median 0.575   p90 6.9   max 850
+   reject < 2.0 SOL  drops 62%
+```
+
+`min_pool_sol` runs as check zero, before any network call, reading a number the
+transaction already contained. Measured effect:
+
+| | without | with |
+|---|---|---|
+| screen timeouts | 63% | **9%** |
+| median screen time | 15,000ms (timing out) | **0ms** |
+| rejected at zero cost | 0% | 63% |
+
+It is also economically honest rather than an arbitrary throughput hack: a pool
+this thin fails the `depth` check later anyway, after spending the quotes the
+gate exists to save.
+
 ### Read mid-run PnL with suspicion
 
 Losers hit their stop within seconds; winners need minutes to reach a

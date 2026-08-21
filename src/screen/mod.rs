@@ -29,6 +29,8 @@ pub struct LaunchContext {
     pub vault: Option<String>,
     /// The pool's LP mint, when the launch created one.
     pub lp_mint: Option<String>,
+    /// SOL placed in the pool at launch, read from the launch transaction.
+    pub pool_sol: Option<f64>,
 }
 
 /// Facts about the mint account, read once and reused by later checks.
@@ -118,6 +120,14 @@ impl Screener {
         ctx: &LaunchContext,
     ) -> (Vec<CheckResult>, Option<i64>, Option<f64>) {
         let mut checks = Vec::new();
+
+        // 0. Free gate first. Everything below costs a network call, and the
+        // aggregator budget is what actually limits throughput, so the cheapest
+        // possible rejection has to come before the expensive ones.
+        checks.extend(liquidity::check_pool_size(&self.cfg, ctx.pool_sol));
+        if disqualified(&checks) {
+            return (checks, None, None);
+        }
 
         // 1. Mint account: authorities and Token-2022 extensions.
         let (auth_checks, facts) = authority::check(&self.rpc, &self.cfg, mint).await;

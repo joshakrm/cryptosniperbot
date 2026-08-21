@@ -25,6 +25,29 @@ use crate::types::CheckResult;
 /// That is the fail-closed direction and it is the intended trade-off -
 /// verifying a locker would mean resolving each holder's owner, and we cannot
 /// enumerate every locker program anyway.
+/// Reject a launch too thin to trade, using only what the transaction already
+/// told us. Runs before any network call, which is the entire point.
+pub fn check_pool_size(cfg: &ScreenConfig, pool_sol: Option<f64>) -> Vec<CheckResult> {
+    if cfg.min_pool_sol <= 0.0 {
+        return Vec::new();
+    }
+    match pool_sol {
+        Some(sol) if sol >= cfg.min_pool_sol => vec![CheckResult::pass(
+            "pool_size",
+            format!("{sol:.2} SOL in the pool at launch"),
+        )],
+        Some(sol) => vec![CheckResult::fail(
+            "pool_size",
+            format!("only {sol:.2} SOL in the pool, need {:.2}", cfg.min_pool_sol),
+        )],
+        // Could not read it, so we cannot claim the pool is deep enough.
+        None => vec![CheckResult::unavailable(
+            "pool_size",
+            "launch transaction did not reveal the pool size",
+        )],
+    }
+}
+
 pub async fn check(
     rpc: &SolanaRpc,
     cfg: &ScreenConfig,
@@ -85,6 +108,55 @@ fn verdict(lp: &str, raw_supply: Option<u128>) -> CheckResult {
 mod tests {
     use super::*;
     use crate::types::Severity;
+
+    fn cfg(min_pool_sol: f64) -> ScreenConfig {
+        // Only min_pool_sol matters here; the rest is inert for this check.
+        let toml = format!(
+            "min_liquidity_sol=1.0
+max_top10_pct=65.0
+min_holders=5
+             require_mint_authority_renounced=true
+require_freeze_authority_renounced=true
+             reject_token2022_extensions=true
+require_lp_burned=true
+require_holders=true
+             max_roundtrip_loss_bps=1500
+max_screen_ms=15000
+min_pool_sol={min_pool_sol}
+"
+        );
+        toml::from_str(&toml).expect("test config")
+    }
+
+    // The aggregator budget is the binding constraint, and this is the only
+    // rejection that costs nothing - it reads a number the launch transaction
+    // already carried. Measured over 225 launches, a 2 SOL floor drops 62%.
+    #[test]
+    fn a_thin_pool_is_rejected_before_any_network_call() {
+        let out = check_pool_size(&cfg(2.0), Some(0.57));
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].passed);
+        assert!(out[0].detail.contains("0.57"), "{}", out[0].detail);
+    }
+
+    #[test]
+    fn a_deep_enough_pool_passes() {
+        let out = check_pool_size(&cfg(2.0), Some(6.9));
+        assert!(out[0].passed, "{}", out[0].detail);
+    }
+
+    #[test]
+    fn an_unreadable_pool_size_does_not_pass() {
+        let out = check_pool_size(&cfg(2.0), None);
+        assert!(!out[0].passed);
+        assert_eq!(out[0].severity, Severity::Unavailable);
+    }
+
+    #[test]
+    fn a_zero_threshold_disables_the_gate_entirely() {
+        assert!(check_pool_size(&cfg(0.0), Some(0.001)).is_empty());
+        assert!(check_pool_size(&cfg(0.0), None).is_empty());
+    }
 
     #[test]
     fn a_burned_lp_passes() {

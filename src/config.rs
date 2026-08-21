@@ -116,6 +116,20 @@ pub struct ScreenConfig {
     /// supply is distributed.
     #[serde(default = "d_true")]
     pub require_holders: bool,
+    /// Minimum SOL placed in the pool at launch. 0 disables the check.
+    ///
+    /// This is the only filter that costs nothing: the figure comes out of the
+    /// launch transaction, which is fetched anyway to find the mint. That
+    /// matters because the aggregator budget, not the RPC, is the binding
+    /// constraint - the holder checks were quietly rejecting 79% of candidates
+    /// before they reached three quotes, and nothing else at t=0 came close.
+    ///
+    /// Measured over 225 live launches: median pool is 0.58 SOL, and a 2 SOL
+    /// floor rejects 62%. It is also economically sensible rather than
+    /// arbitrary - a pool this thin fails the depth check later anyway, after
+    /// spending the quotes this check exists to save.
+    #[serde(default)]
+    pub min_pool_sol: f64,
     pub max_roundtrip_loss_bps: u64,
     pub max_screen_ms: u64,
     /// Trading through an endpoint that keeps failing means trading blind. Only

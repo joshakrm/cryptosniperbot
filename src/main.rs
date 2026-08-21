@@ -317,6 +317,7 @@ async fn handle_candidate(ctx: CandidateCtx, hit: ingest::LogHit) -> Result<()> 
     let launch = LaunchContext {
         vault: decode::extract_vault_account(&tx, &mint),
         lp_mint: decode::extract_lp_mint(&tx, &mint, &quote_mints),
+        pool_sol,
     };
     let report = ctx.screener.screen(&mint, hit.venue, &launch).await;
     ctx.journal.write_typed("screen", &report).await;
