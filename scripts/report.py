@@ -148,6 +148,20 @@ def main():
     # ---- pnl ------------------------------------------------------------
     if closes:
         pnls = sorted(c.get("pnl_sol", 0.0) for c in closes)
+
+        # Self-check. Quoting an exit breakdown from one snapshot alongside a
+        # total from another produces a report that looks authoritative and is
+        # not. That happened, so the report now refuses to hide it.
+        by_reason = collections.Counter(c.get("reason", "?") for c in closes)
+        if sum(by_reason.values()) != len(pnls):
+            print("")
+            print("   !! INCONSISTENT: exit reasons sum to %d, closed trades = %d"
+                  % (sum(by_reason.values()), len(pnls)))
+        reason_sol = sum(c.get("pnl_sol", 0.0) for c in closes)
+        if abs(reason_sol - sum(pnls)) > 1e-9:
+            print("")
+            print("   !! INCONSISTENT: PnL by reason %+.4f != net %+.4f"
+                  % (reason_sol, sum(pnls)))
         wins = [p for p in pnls if p > 0]
         losses = [p for p in pnls if p <= 0]
         total = sum(pnls)
