@@ -1,6 +1,6 @@
 use crate::config::ScreenConfig;
 use crate::rpc::SolanaRpc;
-use crate::types::CheckResult;
+use crate::types::{CheckResult, Venue};
 
 /// Can the creator withdraw the liquidity you are about to trade against?
 ///
@@ -52,6 +52,7 @@ pub async fn check(
     rpc: &SolanaRpc,
     cfg: &ScreenConfig,
     lp_mint: Option<&str>,
+    venue: Venue,
 ) -> Vec<CheckResult> {
     if !cfg.require_lp_burned {
         return Vec::new();
@@ -59,11 +60,28 @@ pub async fn check(
 
     let lp = match lp_mint {
         Some(m) if !m.is_empty() => m,
-        // No LP mint in the launch transaction: a bonding curve. Nothing to pull.
-        _ => {
+
+        // No LP mint found. What that MEANS depends entirely on the venue, and
+        // conflating the two cases is a fail-open.
+        //
+        // On a bonding curve there genuinely is no liquidity position, so there
+        // is nothing to withdraw and this is the safest case there is.
+        _ if venue == Venue::PumpFun => {
             return vec![CheckResult::pass(
                 "lp_burned",
                 "no LP mint - bonding curve, no withdrawable liquidity position",
+            )]
+        }
+
+        // On a pool venue the pool certainly HAS an LP position; failing to
+        // identify it means our discriminator did not work here, not that the
+        // liquidity is locked. Measured on PumpSwap migrations: 41 of 120
+        // candidates passed this check purely because the LP mint could not be
+        // found, which is the check approving what it could not inspect.
+        _ => {
+            return vec![CheckResult::unavailable(
+                "lp_burned",
+                "pool venue but no LP mint identified - cannot confirm liquidity is locked",
             )]
         }
     };
@@ -108,6 +126,15 @@ fn verdict(lp: &str, raw_supply: Option<u128>) -> CheckResult {
 mod tests {
     use super::*;
     use crate::types::Severity;
+
+    fn test_rpc_cfg() -> crate::config::RpcConfig {
+        toml::from_str(
+            "http_url='http://127.0.0.1:1'
+ws_url='ws://127.0.0.1:1'
+jupiter_url='http://127.0.0.1:1'
+"
+        ).expect("test rpc config")
+    }
 
     fn cfg(min_pool_sol: f64) -> ScreenConfig {
         // Only min_pool_sol matters here; the rest is inert for this check.
@@ -156,6 +183,29 @@ min_pool_sol={min_pool_sol}
     fn a_zero_threshold_disables_the_gate_entirely() {
         assert!(check_pool_size(&cfg(0.0), Some(0.001)).is_empty());
         assert!(check_pool_size(&cfg(0.0), None).is_empty());
+    }
+
+    // REGRESSION, measured on 120 PumpSwap migrations: 41 candidates PASSED this
+    // check because extract_lp_mint returned None, and None was being read as
+    // "bonding curve, nothing to withdraw". On a pool venue the pool certainly
+    // has an LP position - failing to find it means the discriminator did not
+    // work, not that the liquidity is locked. The check was approving exactly
+    // what it could not inspect.
+    #[tokio::test]
+    async fn a_pool_venue_with_no_identifiable_lp_does_not_pass() {
+        let rpc = SolanaRpc::new(&test_rpc_cfg()).unwrap();
+        let out = check(&rpc, &cfg(0.0), None, Venue::PumpSwap).await;
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].passed, "{}", out[0].detail);
+        assert_eq!(out[0].severity, Severity::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn a_bonding_curve_with_no_lp_really_is_safe() {
+        let rpc = SolanaRpc::new(&test_rpc_cfg()).unwrap();
+        let out = check(&rpc, &cfg(0.0), None, Venue::PumpFun).await;
+        assert_eq!(out.len(), 1);
+        assert!(out[0].passed, "{}", out[0].detail);
     }
 
     #[test]

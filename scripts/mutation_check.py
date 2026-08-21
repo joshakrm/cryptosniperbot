@@ -132,6 +132,13 @@ MUTATIONS = [
         + "                    if false && age >= self.cfg.max_hold_secs {",
         "an_unmarkable_position_is_released_after_max_hold",
     ),
+    (
+        "LP-not-found treated as safe on pool venues (fail-open)",
+        "src/screen/liquidity.rs",
+        "        _ if venue == Venue::PumpFun => {",
+        "        _ if true => {",
+        "a_pool_venue_with_no_identifiable_lp_does_not_pass",
+    ),
 ]
 
 

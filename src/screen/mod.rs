@@ -161,7 +161,7 @@ impl Screener {
         // 3. Can the creator simply withdraw the pool? One RPC call, and it is
         // the only check that catches a rug which leaves the token untouched.
         // Runs before routing because routing costs three throttled quotes.
-        checks.extend(liquidity::check(&self.rpc, &self.cfg, ctx.lp_mint.as_deref()).await);
+        checks.extend(liquidity::check(&self.rpc, &self.cfg, ctx.lp_mint.as_deref(), venue).await);
 
         if disqualified(&checks) {
             return (checks, None, None);
