@@ -283,6 +283,22 @@ What to look at in `stats`:
 
 ---
 
+## Watching it run
+
+```bash
+wsl -d Ubuntu -- bash -lc "cd /mnt/c/Users/joshr/Documents/solsnipe && python3 scripts/monitor.py journal-free.jsonl"
+```
+
+Then open <http://localhost:8712>. Standard library only, and it reads the
+journal file rather than talking to the bot - no shared state, no port the bot
+listens on, nothing it can break. It works against a finished journal too.
+
+It distinguishes *stopped* from *quiet*, which matters more than it sounds: a bot
+that has stopped entering and a bot with nothing to enter look identical in a log
+tail. The first thing it surfaced was 715 `daily loss cap hit` blocks that had
+been misread as a screening problem - the risk manager had simply capped out at
+`max_daily_loss_sol` and stopped trading, exactly as designed.
+
 ## Development
 
 ```bash
