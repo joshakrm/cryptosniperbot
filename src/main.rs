@@ -7,6 +7,7 @@ mod position;
 mod risk;
 mod rpc;
 mod screen;
+mod shadow;
 mod types;
 
 use anyhow::{Context, Result};
@@ -145,6 +146,18 @@ async fn run(config_path: &Path, journal_path: &Path) -> Result<()> {
         jup.clone(),
         cfg.programs.wsol_mint.clone(),
     ));
+    let shadow = Arc::new(crate::shadow::Shadow::new(
+        prices.clone(),
+        journal.clone(),
+        cfg.shadow.clone(),
+    ));
+    if shadow.enabled() {
+        info!(
+            sample_pct = cfg.shadow.sample_pct,
+            "shadow tracking on - following a sample of candidates the bot does not trade"
+        );
+    }
+
     let pm = Arc::new(PositionManager::new(
         prices,
         executor.clone(),
@@ -224,6 +237,7 @@ async fn run(config_path: &Path, journal_path: &Path) -> Result<()> {
             risk: risk.clone(),
             executor: executor.clone(),
             pm: pm.clone(),
+            shadow: shadow.clone(),
             journal: journal.clone(),
             seen: seen.clone(),
         };
@@ -248,6 +262,7 @@ struct CandidateCtx {
     risk: Arc<RiskManager>,
     executor: Arc<dyn Executor>,
     pm: Arc<PositionManager>,
+    shadow: Arc<crate::shadow::Shadow>,
     journal: Arc<Journal>,
     seen: Arc<Mutex<HashSet<String>>>,
 }
@@ -321,6 +336,26 @@ async fn handle_candidate(ctx: CandidateCtx, hit: ingest::LogHit) -> Result<()> 
     };
     let report = ctx.screener.screen(&mint, hit.venue, &launch).await;
     ctx.journal.write_typed("screen", &report).await;
+
+    // Follow a sample of candidates regardless of the verdict. This has to
+    // happen for REJECTED ones above all - they are the control group, and
+    // without them there is no way to tell a filter that removes losers from
+    // one that removes winners.
+    ctx.shadow.clone().track(
+        mint.clone(),
+        hit.venue,
+        decimals,
+        crate::shadow::ShadowVerdict {
+            approved: report.approved(),
+            rejected_by: report
+                .rejections()
+                .iter()
+                .map(|c| c.name.to_string())
+                .collect(),
+            pool_sol: launch.pool_sol,
+            creator_share_pct,
+        },
+    );
 
     if !report.approved() {
         info!(%mint, venue = ?hit.venue, "{}", report.summary());

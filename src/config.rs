@@ -12,6 +12,8 @@ pub struct Config {
     pub paper: PaperConfig,
     #[serde(default)]
     pub live: LiveConfig,
+    #[serde(default)]
+    pub shadow: ShadowConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -178,6 +180,39 @@ pub struct PaperConfig {
     pub priority_fee_sol: f64,
     pub latency_penalty_bps: u64,
     pub fill_probability: f64,
+}
+
+/// Follows a sample of candidates the bot did NOT trade, so filters can be
+/// judged on outcomes rather than on plausibility. See src/shadow.rs.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShadowConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Percent of candidates to follow. Kept small: this is a control group,
+    /// not a second strategy, and every shadow costs quotes.
+    #[serde(default = "d_shadow_pct")]
+    pub sample_pct: f64,
+    /// Fixed notional used for every shadow price, so returns are comparable
+    /// across candidates instead of varying with an intended position size.
+    #[serde(default = "d_shadow_probe")]
+    pub probe_size_sol: f64,
+    /// Seconds after first sight at which to price the token.
+    #[serde(default = "d_shadow_marks")]
+    pub marks_secs: Vec<u64>,
+}
+fn d_shadow_pct() -> f64 { 5.0 }
+fn d_shadow_probe() -> f64 { 0.1 }
+fn d_shadow_marks() -> Vec<u64> { vec![60, 300, 900] }
+
+impl Default for ShadowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sample_pct: d_shadow_pct(),
+            probe_size_sol: d_shadow_probe(),
+            marks_secs: d_shadow_marks(),
+        }
+    }
 }
 
 #[allow(dead_code)] // parsed to keep the config shape stable; live exec is unimplemented

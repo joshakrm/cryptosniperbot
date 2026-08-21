@@ -148,3 +148,17 @@ enabled = false
 keypair_path = ""
 jito_tip_sol = 0.0
 max_slippage_bps = 500
+
+[shadow]
+# Follows a random sample of candidates the bot does NOT trade, so filters can be
+# judged on outcomes instead of plausibility. Without this there is no control
+# group: a filter that rejects 79% of candidates looks identical whether it is
+# removing losers or removing winners.
+#
+# Cost is small and deliberately low-priority: 4 quotes per shadowed candidate,
+# all behind live screening in the throttle. At ~1750 launches/hour a 5% sample
+# is roughly 0.1 requests/second.
+enabled     = true
+sample_pct  = 5.0
+probe_size_sol = 0.1
+marks_secs  = [60, 300, 900]
