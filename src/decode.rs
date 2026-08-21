@@ -232,6 +232,79 @@ pub fn extract_vault_account(tx: &Value, mint: &str) -> Option<Pubkey> {
     None
 }
 
+/// Two numbers the launch transaction already contains, for free.
+///
+/// The transaction is fetched anyway to find the mint, so reading more out of it
+/// costs nothing - and cost is the whole problem. The holder checks that made
+/// the aggregator budget viable need an index that lags launches by ~13s, and
+/// the checks that survive without it reject only 3% of candidates. Anything
+/// that filters at t=0 has to come out of data already in hand.
+///
+/// Returns (creator share of supply as a percentage, SOL placed in the pool).
+/// Recorded rather than enforced: thresholds should come from a measured
+/// distribution, not from a guess.
+pub fn extract_launch_metrics(
+    tx: &Value,
+    mint: &str,
+) -> (Option<f64>, Option<f64>) {
+    let meta = match tx.get("meta") {
+        Some(m) => m,
+        None => return (None, None),
+    };
+    let payer = extract_creator(tx);
+
+    // --- creator share of the launched token -----------------------------
+    let mut total = 0.0f64;
+    let mut creator = 0.0f64;
+    if let Some(arr) = meta.get("postTokenBalances").and_then(|v| v.as_array()) {
+        for e in arr {
+            if e.get("mint").and_then(|v| v.as_str()) != Some(mint) {
+                continue;
+            }
+            let amt = e
+                .get("uiTokenAmount")
+                .and_then(|u| u.get("uiAmount"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            total += amt;
+            if let (Some(owner), Some(p)) = (e.get("owner").and_then(|v| v.as_str()), payer.as_deref())
+            {
+                if owner == p {
+                    creator += amt;
+                }
+            }
+        }
+    }
+    let share = if total > 0.0 {
+        Some(100.0 * creator / total)
+    } else {
+        None
+    };
+
+    // --- SOL that landed somewhere other than the fee payer --------------
+    // The largest positive lamport delta is the pool or bonding curve being
+    // funded. Index 0 is the fee payer and is skipped.
+    let pre = meta.get("preBalances").and_then(|v| v.as_array());
+    let post = meta.get("postBalances").and_then(|v| v.as_array());
+    let pool_sol = match (pre, post) {
+        (Some(pre), Some(post)) => {
+            let mut best = 0.0f64;
+            for i in 1..pre.len().min(post.len()) {
+                let a = pre[i].as_f64().unwrap_or(0.0);
+                let b = post[i].as_f64().unwrap_or(0.0);
+                let delta = (b - a) / crate::types::LAMPORTS_PER_SOL;
+                if delta > best {
+                    best = delta;
+                }
+            }
+            Some(best)
+        }
+        _ => None,
+    };
+
+    (share, pool_sol)
+}
+
 /// Fee payer of the transaction: the cheapest available proxy for "the dev".
 pub fn extract_creator(tx: &Value) -> Option<Pubkey> {
     tx.get("transaction")?
@@ -352,6 +425,63 @@ mod tests {
     }
 
     const LPM: &str = "LPMINT11111111111111111111111111111111111111";
+
+    fn tx_with_sol(entries: &[(&str, &str, f64)], pre: &[u64], post: &[u64]) -> serde_json::Value {
+        let balances: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .map(|(i, (mint, owner, amt))| {
+                json!({
+                    "accountIndex": i,
+                    "mint": mint,
+                    "owner": owner,
+                    "uiTokenAmount": { "amount": "0", "decimals": 6, "uiAmount": amt }
+                })
+            })
+            .collect();
+        json!({
+            "meta": {
+                "postTokenBalances": balances,
+                "preTokenBalances": [],
+                "preBalances": pre,
+                "postBalances": post
+            },
+            "transaction": {
+                "message": { "accountKeys": [{ "pubkey": "DEV111" }, { "pubkey": "OTHER" }] }
+            }
+        })
+    }
+
+    #[test]
+    fn reads_the_creator_share_of_supply() {
+        // Curve holds 600, creator holds 400 -> 40%.
+        let t = tx_with_sol(
+            &[(NEW, "CURVE", 600.0), (NEW, "DEV111", 400.0)],
+            &[0, 0],
+            &[0, 0],
+        );
+        let (share, _) = extract_launch_metrics(&t, NEW);
+        assert!((share.unwrap() - 40.0).abs() < 1e-9, "{share:?}");
+    }
+
+    #[test]
+    fn reads_the_sol_placed_in_the_pool() {
+        // Index 0 is the fee payer and must be ignored even if it gained.
+        let t = tx_with_sol(
+            &[(NEW, "CURVE", 1.0)],
+            &[0, 0, 0],
+            &[9_000_000_000, 2_500_000_000, 100],
+        );
+        let (_, sol) = extract_launch_metrics(&t, NEW);
+        assert!((sol.unwrap() - 2.5).abs() < 1e-9, "{sol:?}");
+    }
+
+    #[test]
+    fn launch_metrics_survive_a_transaction_with_nothing_in_it() {
+        let (share, sol) = extract_launch_metrics(&json!({}), NEW);
+        assert_eq!(share, None);
+        assert_eq!(sol, None);
+    }
 
     #[test]
     fn finds_the_lp_mint_a_pool_creation_minted() {

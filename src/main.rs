@@ -288,6 +288,10 @@ async fn handle_candidate(ctx: CandidateCtx, hit: ingest::LogHit) -> Result<()> 
         }
     };
 
+    // Free metrics: the transaction is already in hand. Recorded, not enforced -
+    // they exist so a threshold can later be chosen from a real distribution.
+    let (creator_share_pct, pool_sol) = decode::extract_launch_metrics(&tx, &mint);
+
     ctx.journal
         .write(
             "candidate",
@@ -298,6 +302,8 @@ async fn handle_candidate(ctx: CandidateCtx, hit: ingest::LogHit) -> Result<()> 
                 "slot": hit.slot,
                 "creator": creator,
                 "decimals": decimals,
+                "creator_share_pct": creator_share_pct,
+                "pool_sol": pool_sol,
             }),
         )
         .await;

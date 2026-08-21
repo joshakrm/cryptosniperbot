@@ -450,6 +450,32 @@ protecting itself from rate limits pushed screening past its own deadline.
 to change. It is the kind of interlock that no single check can see and that
 costs a whole run to discover empirically.
 
+### The holder check was doing two jobs, and only one was safety
+
+Measured across both configurations:
+
+| | rejected by a cheap check | reached routing |
+|---|---|---|
+| holders on | **79%** (1,700 of 2,154) | 14% |
+| holders off | **3%** (57 of 1,749) | 8% |
+
+One RPC call was turning away four candidates in five before any of them reached
+the three aggregator quotes that actually cost budget. Remove it and everything
+goes to routing, which is ~1.5 req/s against a free-tier ceiling near 1 — hence
+89% of screens timing out.
+
+The checks that survive at t=0 cannot replace it. `lp_burned` rejects 3%, because
+most pump.fun launches are bonding curves with no LP mint to examine. The
+authority checks fired **once each in 2,154 screens**: pump.fun renounces mint
+and freeze authority by construction, so they are real rug protection and useless
+as a filter.
+
+So a fast-entry configuration needs a filter that works at t=0 and costs nothing.
+`extract_launch_metrics` records two candidates for the role — creator share of
+supply, and SOL placed in the pool — both read out of the launch transaction that
+is fetched anyway. They are **recorded, not enforced**: a threshold should come
+from a measured distribution, the way the exit thresholds should have.
+
 ### Read mid-run PnL with suspicion
 
 Losers hit their stop within seconds; winners need minutes to reach a
