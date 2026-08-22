@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
@@ -83,7 +83,31 @@ async fn connect_and_stream(cfg: &Config, out: &mpsc::Sender<LogHit>) -> Result<
     const IDLE_TIMEOUT: Duration = Duration::from_secs(45);
     let mut silent_rounds: u8 = 0;
 
+    // Frames arriving is not the same as the SUBSCRIPTION being alive, and only
+    // the second one matters. Measured on publicnode: the socket kept trading
+    // pings for 15 minutes while logsSubscribe delivered nothing at all, so
+    // every ping reset silent_rounds and the check above never fired. The
+    // process heartbeated normally the whole time and journalled no launches -
+    // a stall that looks exactly like a quiet market.
+    //
+    // So liveness is tracked on log notifications specifically. Across four
+    // program subscriptions at roughly 1750 pump.fun launches an hour, five
+    // minutes of genuine silence does not happen; if it does, a needless
+    // reconnect costs a few hundred milliseconds and being deaf costs the run.
+    const DATA_TIMEOUT: Duration = Duration::from_secs(300);
+    let mut last_data = Instant::now();
+
     loop {
+        // Checked before the read so it fires whether the socket is silent or
+        // chattering: a peer that pings on schedule and delivers nothing would
+        // otherwise never reach a timeout branch.
+        if !subs.is_empty() && last_data.elapsed() > DATA_TIMEOUT {
+            bail!(
+                "subscriptions confirmed but no log notification for {}s - socket is deaf",
+                last_data.elapsed().as_secs()
+            );
+        }
+
         let frame = match tokio::time::timeout(IDLE_TIMEOUT, reader.next()).await {
             Ok(Some(f)) => {
                 silent_rounds = 0;
@@ -155,6 +179,10 @@ async fn connect_and_stream(cfg: &Config, out: &mpsc::Sender<LogHit>) -> Result<
         if v.get("method").and_then(|m| m.as_str()) != Some("logsNotification") {
             continue;
         }
+
+        // Reached only for real subscription data, which is the point: this is
+        // the one event that proves the stream is still feeding us.
+        last_data = Instant::now();
 
         let params = match v.get("params") {
             Some(p) => p,
