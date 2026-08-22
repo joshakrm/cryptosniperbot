@@ -11,3 +11,4 @@ keypair.json
 social_cache.json
 candidate_mints.json
 closed_mints.txt
+wallet_cache.json
