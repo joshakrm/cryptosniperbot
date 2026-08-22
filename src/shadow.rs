@@ -62,6 +62,29 @@ impl Shadow {
         bucket < (self.cfg.sample_pct * 100.0) as u64
     }
 
+    /// Follow a mint regardless of sampling.
+    ///
+    /// Used for positions that have just CLOSED. Marks otherwise stop at the
+    /// exit, which means a replay can evaluate a tighter stop but never a looser
+    /// one - there is no price data after the stop fired. That asymmetry would
+    /// make every replay conclude that tighter is better, which is precisely the
+    /// conclusion the data could not support. Closed positions are few (tens per
+    /// day), so following all of them is cheap.
+    pub fn track_after_exit(
+        self: Arc<Self>,
+        mint: String,
+        venue: Venue,
+        decimals: u8,
+        verdict: ShadowVerdict,
+    ) {
+        if !self.cfg.enabled {
+            return;
+        }
+        tokio::spawn(async move {
+            self.follow(mint, venue, decimals, verdict, true).await;
+        });
+    }
+
     /// Follow one candidate to the end of its checkpoints, then journal it.
     ///
     /// Spawned rather than awaited: this outlives the screening decision by
@@ -77,11 +100,18 @@ impl Shadow {
             return;
         }
         tokio::spawn(async move {
-            self.follow(mint, venue, decimals, verdict).await;
+            self.follow(mint, venue, decimals, verdict, false).await;
         });
     }
 
-    async fn follow(&self, mint: String, venue: Venue, decimals: u8, verdict: ShadowVerdict) {
+    async fn follow(
+        &self,
+        mint: String,
+        venue: Venue,
+        decimals: u8,
+        verdict: ShadowVerdict,
+        post_exit: bool,
+    ) {
         // A fixed notional for every shadow, so the prices are comparable across
         // candidates rather than varying with an intended position size.
         let probe = self.cfg.probe_size_sol.max(0.001);
@@ -130,6 +160,7 @@ impl Shadow {
                     "mint": mint,
                     "venue": venue,
                     "approved": verdict.approved,
+                    "post_exit": post_exit,
                     "rejected_by": verdict.rejected_by,
                     "pool_sol": verdict.pool_sol,
                     "creator_share_pct": verdict.creator_share_pct,

@@ -52,6 +52,7 @@ pub async fn check(
     rpc: &SolanaRpc,
     cfg: &ScreenConfig,
     lp_mint: Option<&str>,
+    other_mints: &[String],
     venue: Venue,
 ) -> Vec<CheckResult> {
     if !cfg.require_lp_burned {
@@ -74,16 +75,20 @@ pub async fn check(
         }
 
         // On a pool venue the pool certainly HAS an LP position; failing to
-        // identify it means our discriminator did not work here, not that the
-        // liquidity is locked. Measured on PumpSwap migrations: 41 of 120
-        // candidates passed this check purely because the LP mint could not be
-        // found, which is the check approving what it could not inspect.
-        _ => {
-            return vec![CheckResult::unavailable(
-                "lp_burned",
-                "pool venue but no LP mint identified - cannot confirm liquidity is locked",
-            )]
-        }
+        // identify it means the payer-only discriminator did not work here, not
+        // that the liquidity is locked.
+        //
+        // That case is not rare and it is not junk: a pump.fun graduation mints
+        // LP to a protocol PDA rather than to the payer, so every canonical
+        // graduation lands here. Rejecting them outright would discard the whole
+        // migration venue; passing them on the grounds that a wrapper program was
+        // involved would be a structural exemption granted on assumption.
+        //
+        // So measure it instead. Test the supply of every other mint the
+        // transaction touched: a burned LP reports zero, and that is evidence
+        // rather than inference. One extra RPC call at roughly 28 graduations an
+        // hour.
+        _ => return check_unidentified_lp(rpc, other_mints).await,
     };
 
     let supply = match rpc.get_token_supply(&lp.to_string()).await {
@@ -103,6 +108,52 @@ pub async fn check(
         .and_then(|s| s.parse::<u128>().ok());
 
     vec![verdict(lp, raw)]
+}
+
+/// When the LP mint could not be named, look for a burned one among the mints
+/// the transaction actually touched.
+///
+/// Zero supply is the signature of a burn. Finding one is positive evidence the
+/// liquidity is locked; finding only non-zero supplies means we could not
+/// confirm it, and that fails closed as everywhere else here.
+async fn check_unidentified_lp(rpc: &SolanaRpc, other_mints: &[String]) -> Vec<CheckResult> {
+    if other_mints.is_empty() {
+        return vec![CheckResult::unavailable(
+            "lp_burned",
+            "pool venue with no candidate LP mint to inspect",
+        )];
+    }
+
+    let mut inspected = 0usize;
+    for m in other_mints.iter().take(4) {
+        let supply = match rpc.get_token_supply(m).await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let raw = supply
+            .get("value")
+            .and_then(|v| v.get("amount"))
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.parse::<u128>().ok());
+        inspected += 1;
+        if raw == Some(0) {
+            return vec![CheckResult::pass(
+                "lp_burned",
+                format!("LP {} burned by the migration - liquidity locked", &m[..m.len().min(8)]),
+            )];
+        }
+    }
+
+    if inspected == 0 {
+        return vec![CheckResult::unavailable(
+            "lp_burned",
+            "could not read the supply of any candidate LP mint",
+        )];
+    }
+    vec![CheckResult::fail(
+        "lp_burned",
+        format!("no burned LP among {inspected} candidate mint(s) - liquidity may be withdrawable"),
+    )]
 }
 
 /// Supply to verdict. Separated so the rule can be tested without a network.
@@ -194,8 +245,20 @@ min_pool_sol={min_pool_sol}
     #[tokio::test]
     async fn a_pool_venue_with_no_identifiable_lp_does_not_pass() {
         let rpc = SolanaRpc::new(&test_rpc_cfg()).unwrap();
-        let out = check(&rpc, &cfg(0.0), None, Venue::PumpSwap).await;
+        let out = check(&rpc, &cfg(0.0), None, &[], Venue::PumpSwap).await;
         assert_eq!(out.len(), 1);
+        assert!(!out[0].passed, "{}", out[0].detail);
+        assert_eq!(out[0].severity, Severity::Unavailable);
+    }
+
+    // A graduation mints LP to a protocol PDA, so the payer-only heuristic finds
+    // nothing and the check falls back to testing candidate mints for a burn.
+    // With no candidates to test it must not pass - that is the fail-open the
+    // whole branch exists to prevent.
+    #[tokio::test]
+    async fn a_pool_venue_with_candidates_it_cannot_read_does_not_pass() {
+        let rpc = SolanaRpc::new(&test_rpc_cfg()).unwrap();
+        let out = check(&rpc, &cfg(0.0), None, &["SomeMint111".to_string()], Venue::PumpSwap).await;
         assert!(!out[0].passed, "{}", out[0].detail);
         assert_eq!(out[0].severity, Severity::Unavailable);
     }
@@ -203,7 +266,7 @@ min_pool_sol={min_pool_sol}
     #[tokio::test]
     async fn a_bonding_curve_with_no_lp_really_is_safe() {
         let rpc = SolanaRpc::new(&test_rpc_cfg()).unwrap();
-        let out = check(&rpc, &cfg(0.0), None, Venue::PumpFun).await;
+        let out = check(&rpc, &cfg(0.0), None, &[], Venue::PumpFun).await;
         assert_eq!(out.len(), 1);
         assert!(out[0].passed, "{}", out[0].detail);
     }

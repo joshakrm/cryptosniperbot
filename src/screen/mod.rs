@@ -31,6 +31,9 @@ pub struct LaunchContext {
     pub lp_mint: Option<String>,
     /// SOL placed in the pool at launch, read from the launch transaction.
     pub pool_sol: Option<f64>,
+    /// Every other mint the launch transaction touched, so the liquidity check
+    /// can test for a burned LP when it cannot name one outright.
+    pub other_mints: Vec<String>,
 }
 
 /// Facts about the mint account, read once and reused by later checks.
@@ -161,7 +164,16 @@ impl Screener {
         // 3. Can the creator simply withdraw the pool? One RPC call, and it is
         // the only check that catches a rug which leaves the token untouched.
         // Runs before routing because routing costs three throttled quotes.
-        checks.extend(liquidity::check(&self.rpc, &self.cfg, ctx.lp_mint.as_deref(), venue).await);
+        checks.extend(
+            liquidity::check(
+                &self.rpc,
+                &self.cfg,
+                ctx.lp_mint.as_deref(),
+                &ctx.other_mints,
+                venue,
+            )
+            .await,
+        );
 
         if disqualified(&checks) {
             return (checks, None, None);

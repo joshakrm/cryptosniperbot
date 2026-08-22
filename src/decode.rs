@@ -175,6 +175,34 @@ pub fn extract_lp_mint(tx: &Value, base_mint: &str, quote_mints: &[&str]) -> Opt
         .map(|(m, _)| m)
 }
 
+/// Every non-base, non-quote mint the transaction touched.
+///
+/// `extract_lp_mint` only recognises an LP mint held exclusively by the fee
+/// payer. A pump.fun graduation mints LP to a protocol PDA instead, so that
+/// heuristic returns None on exactly the venue that matters most. This gives the
+/// liquidity check something to test empirically rather than a reason to assume.
+pub fn extract_other_mints(tx: &Value, base_mint: &str, quote_mints: &[&str]) -> Vec<Pubkey> {
+    let meta = match tx.get("meta") {
+        Some(m) => m,
+        None => return Vec::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for key in ["postTokenBalances", "preTokenBalances"] {
+        let arr = match meta.get(key).and_then(|v| v.as_array()) {
+            Some(a) => a,
+            None => continue,
+        };
+        for e in arr {
+            if let Some(m) = e.get("mint").and_then(|v| v.as_str()) {
+                if m != base_mint && !quote_mints.contains(&m) && !out.iter().any(|x| x == m) {
+                    out.push(m.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The pool's token account for `mint`, when this transaction created one.
 ///
 /// getTokenLargestAccounts returns token ACCOUNT addresses, while balance

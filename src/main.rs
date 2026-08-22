@@ -164,6 +164,7 @@ async fn run(config_path: &Path, journal_path: &Path) -> Result<()> {
         cfg.exit.clone(),
         risk.clone(),
         journal.clone(),
+        shadow.clone(),
     ));
 
     info!(
@@ -332,6 +333,7 @@ async fn handle_candidate(ctx: CandidateCtx, hit: ingest::LogHit) -> Result<()> 
     let launch = LaunchContext {
         vault: decode::extract_vault_account(&tx, &mint),
         lp_mint: decode::extract_lp_mint(&tx, &mint, &quote_mints),
+        other_mints: decode::extract_other_mints(&tx, &mint, &quote_mints),
         pool_sol,
     };
     let report = ctx.screener.screen(&mint, hit.venue, &launch).await;

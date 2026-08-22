@@ -12,6 +12,7 @@ use crate::exec::Executor;
 use crate::journal::Journal;
 use crate::risk::RiskManager;
 use crate::rpc::PriceSource;
+use crate::shadow::{Shadow, ShadowVerdict};
 use crate::types::{ExitReason, Position, Venue};
 
 /// Consecutive sweeps with no sell route before a position is written off.
@@ -36,6 +37,9 @@ pub struct PositionManager {
     cfg: ExitConfig,
     risk: Arc<RiskManager>,
     journal: Arc<Journal>,
+    /// Closed positions are handed here so their price path continues past the
+    /// exit; without it a replay can only ever evaluate tighter stops.
+    shadow: Arc<Shadow>,
     positions: Mutex<HashMap<String, Position>>,
 }
 
@@ -46,6 +50,7 @@ impl PositionManager {
         cfg: ExitConfig,
         risk: Arc<RiskManager>,
         journal: Arc<Journal>,
+        shadow: Arc<Shadow>,
     ) -> Self {
         Self {
             prices,
@@ -53,8 +58,23 @@ impl PositionManager {
             cfg,
             risk,
             journal,
+            shadow,
             positions: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Keep pricing a position after it closed, so the recorded path covers what
+    /// a looser exit would have caught.
+    fn follow_after_exit(&self, pos: &Position) {
+        self.shadow.clone().track_after_exit(
+            pos.mint.clone(),
+            pos.venue,
+            pos.decimals,
+            ShadowVerdict {
+                approved: true,
+                ..Default::default()
+            },
+        );
     }
 
     pub async fn is_open(&self, mint: &str) -> bool {
@@ -202,13 +222,49 @@ impl PositionManager {
     }
 
     /// Remember the last real price, and clear any accumulated strikes.
+    /// Remember the last real price, clear any strikes, and JOURNAL the mark.
+    ///
+    /// The quote has already been paid for; throwing the number away afterwards
+    /// is pure waste. Journalling the whole path rather than only the peak is
+    /// what makes exit policy a post-processing question: decide_exit() is a
+    /// pure function of (position, price, age, config), so a replay can run the
+    /// SHIPPING exit logic over recorded paths instead of a reimplementation of
+    /// it, and compare policies without collecting new data.
     async fn record_mark(&self, mint: &str, price: f64, had_strikes: bool) {
-        let mut map = self.positions.lock().await;
-        if let Some(p) = map.get_mut(mint) {
-            p.last_price_sol = Some(price);
-            if had_strikes {
-                p.unroutable_strikes = 0;
+        let entry = {
+            let mut map = self.positions.lock().await;
+            match map.get_mut(mint) {
+                Some(p) => {
+                    p.last_price_sol = Some(price);
+                    if had_strikes {
+                        p.unroutable_strikes = 0;
+                    }
+                    Some((p.entry_price_sol, p.opened_at, p.tokens_held))
+                }
+                None => None,
             }
+        };
+
+        if let Some((entry_price, opened_at, tokens)) = entry {
+            let age = (Utc::now() - opened_at).num_seconds();
+            let gain_bps = if entry_price > 0.0 {
+                (((price / entry_price) - 1.0) * 10_000.0) as i64
+            } else {
+                0
+            };
+            self.journal
+                .write(
+                    "mark",
+                    json!({
+                        "mint": mint,
+                        "price_sol": price,
+                        "entry_price_sol": entry_price,
+                        "gain_bps": gain_bps,
+                        "age_s": age,
+                        "tokens_held": tokens,
+                    }),
+                )
+                .await;
         }
     }
 
@@ -327,6 +383,7 @@ impl PositionManager {
                 )
                 .await;
             self.risk.record_exit(pnl, true).await;
+            self.follow_after_exit(pos);
         }
     }
 
@@ -357,6 +414,7 @@ impl PositionManager {
                 )
                 .await;
             self.risk.record_exit(pnl, true).await;
+            self.follow_after_exit(&p);
         }
     }
 }
@@ -530,12 +588,20 @@ mod tests {
             fill_probability: 1.0,
         }));
         let journal = Arc::new(Journal::open(&temp_journal()).await.unwrap());
+        // Shadow disabled in tests: post-exit following is a data-collection
+        // concern and would only add sleeping tasks here.
+        let shadow = Arc::new(Shadow::new(
+            Arc::new(StubPrices::new(vec![])),
+            journal.clone(),
+            crate::config::ShadowConfig { enabled: false, ..Default::default() },
+        ));
         let pm = Arc::new(PositionManager::new(
             Arc::new(StubPrices::new(ticks)),
             paper,
             cfg(),
             risk.clone(),
             journal,
+            shadow,
         ));
         (pm, risk)
     }
