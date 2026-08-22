@@ -176,10 +176,27 @@ fn d_dust() -> f64 { 0.005 }
 #[derive(Debug, Clone, Deserialize)]
 pub struct PaperConfig {
     pub starting_balance_sol: f64,
-    pub slippage_bps: u64,
     pub priority_fee_sol: f64,
+    /// How far the price runs between the quote being taken and a real
+    /// transaction landing. This is the one cost the quote genuinely cannot
+    /// know, so it is the only adjustment applied to it by default.
     pub latency_penalty_bps: u64,
     pub fill_probability: f64,
+    /// Cost charged ON TOP of what the Jupiter quote already prices.
+    ///
+    /// Defaults to zero, and should usually stay there. Quotes are taken at the
+    /// real position size on both sides - the buy at entry_size_sol, the mark at
+    /// tokens actually held - so spread and size-dependent impact are already in
+    /// the number. Anything added here is added on top of them.
+    ///
+    /// Raise it only to model a gap you have MEASURED between paper fills and
+    /// live ones, and say what the measurement was.
+    #[serde(default)]
+    pub extra_slippage_bps: u64,
+    /// Removed, and deliberately still parsed so that a config which sets it
+    /// fails loudly instead of having the field silently ignored.
+    #[serde(default)]
+    pub slippage_bps: Option<u64>,
 }
 
 /// Follows a sample of candidates the bot did NOT trade, so filters can be
@@ -250,6 +267,21 @@ impl Config {
         }
         if self.risk.position_size_sol <= 0.0 {
             bail!("risk.position_size_sol must be > 0");
+        }
+        // A removed field that changes the cost model must never be ignored in
+        // silence: the config would keep parsing and every P&L figure would
+        // quietly move. Measured before removal: this charged a flat 800 bps on
+        // entry, exactly 800.0 on all 77 trades of a 3h run, of which 300 was
+        // this field re-charging impact the quote had already priced.
+        if self.paper.slippage_bps.is_some() {
+            bail!(
+                "paper.slippage_bps has been removed - it double-counted price impact.
+                 Jupiter quotes are taken at the real size on both sides (buy at
+                 entry_size_sol, mark at tokens held), so spread and impact are
+                 already in the quoted price; this field charged them a second time.
+                 Delete the line. If you have MEASURED a gap between paper and live
+                 fills, express it as paper.extra_slippage_bps instead."
+            );
         }
         if !(0.0..=1.0).contains(&self.paper.fill_probability) {
             bail!("paper.fill_probability must be between 0.0 and 1.0");

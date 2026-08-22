@@ -582,10 +582,11 @@ mod tests {
         }));
         let paper = Arc::new(PaperExecutor::new(PaperConfig {
             starting_balance_sol: 10_000.0,
-            slippage_bps: 0,
             priority_fee_sol: 0.0,
             latency_penalty_bps: 0,
             fill_probability: 1.0,
+            extra_slippage_bps: 0,
+            slippage_bps: None,
         }));
         let journal = Arc::new(Journal::open(&temp_journal()).await.unwrap());
         // Shadow disabled in tests: post-exit following is a data-collection

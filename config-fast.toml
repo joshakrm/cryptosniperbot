@@ -131,7 +131,10 @@ dust_value_sol    = 0.005
 
 [paper]
 starting_balance_sol = 10.0
-slippage_bps         = 300    # your realistic slippage on entry
+extra_slippage_bps  = 0      # on top of what the quote already prices - keep at 0.
+                             # This was 300, which re-charged the spread and impact
+                             # the Jupiter quote had already included, on both sides.
+                             # Raise only for a gap you have measured live.
 priority_fee_sol     = 0.001  # what you would actually pay per tx
 # THE HONEST KNOB. In a real snipe you are not first. By the time your tx lands
 # the price has already run. Set this from measured data, not hope. 0 = fantasy.
