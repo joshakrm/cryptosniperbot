@@ -16,6 +16,15 @@ way, including the thousands that were rejected and never traded.
 So this asks the selection question directly: among candidates seen at launch,
 which freely-observable property separates the ones that went on to graduate?
 
+THE CIRCULARITY THAT MUST BE CONTROLLED FOR. A pump_swap candidate IS a
+migration, and a migration is a token that has already graduated - so
+`complete` is true there by construction, not by outcome. Measured: pump_swap
+graduates at 96.97% against pump_fun's 2.17%. Leaving those 33 rows in made
+pool_sol look like a perfect predictor (19 of 19 above 20 SOL "graduated")
+when the 20+ SOL band simply IS the migration band, at a fixed 67.41 or 85.01
+SOL. Every headline in the uncontrolled run came from this. So this script
+now analyses one venue at a time and never pools them.
+
 CAVEATS, because they matter more than the numbers:
   - Graduation is measured NOW, so a candidate seen an hour ago has had less
     time to graduate than one seen three days ago. Compare within an age band
@@ -133,6 +142,29 @@ def main():
     print(" graduation analysis: %d candidates resolved of %d" % (len(rows), len(mints)))
     print("=" * 78)
 
+    # Venue first, and loudly, because pooling them is the one error that makes
+    # everything downstream look spectacular and mean nothing.
+    byv = collections.defaultdict(list)
+    for r in rows:
+        byv[r["_j"].get("venue") or "?"].append(r)
+    print("")
+    print(" GRADUATION BY VENUE - read this before anything else")
+    for v, g in sorted(byv.items(), key=lambda kv: -len(kv[1])):
+        gr = sum(1 for x in g if x.get("complete"))
+        print("   %-14s n=%-5d graduated %3d (%6.2f%%)" % (v, len(g), gr, 100.0 * gr / len(g)))
+    print("   A migration venue graduates at ~100% by construction: the token had")
+    print("   already graduated before the bot ever saw it. Those rows are excluded")
+    print("   below rather than pooled.")
+
+    rows = byv.get("pump_fun") or []
+    if not rows:
+        print("")
+        print(" No pump_fun launches in this sample - nothing to analyse.")
+        return 1
+    print("")
+    print("=" * 78)
+    print(" pump_fun launches only: n=%d" % len(rows))
+    print("=" * 78)
     base = rate("ALL (base rate)", rows)
     print("")
 
@@ -154,6 +186,8 @@ def main():
 
     print("")
     print(" BY POOL SOL AT LAUNCH (what the free gate reads)")
+    print(" NOTE: within pump_fun this was flat - 1.96%/0.00%/1.75%/2.56% across")
+    print(" the bands. The apparent pool_sol effect was entirely the migration venue.")
     for lo, hi, lbl in ((0, 1, "< 1 SOL"), (1, 2, "1-2"), (2, 5, "2-5"),
                         (5, 20, "5-20"), (20, 1e9, "20+")):
         rate(lbl, [r for r in rows
