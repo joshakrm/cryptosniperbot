@@ -101,8 +101,13 @@ max_concurrent_positions = 12   # raised now that marks no longer starve
                                 # per quarter hour regardless of how many tokens
                                 # passed screening. Raised for paper data gathering;
                                 # drop it back before ever going live.
-max_daily_loss_sol      = 2.0
-max_trades_per_day      = 40
+max_daily_loss_sol      = 50.0  # likewise raised for data collection only. At 2.0
+                                # the bot capped out and stopped trading mid-run,
+                                # which reads as a screening problem and is not one.
+max_trades_per_day      = 1000  # was 40, which is a sensible REAL-MONEY limit and
+                                # the wrong limit for a data-collection phase: it
+                                # stopped a 2h run after 40 entries and produced 125
+                                # blocks. Put it back to ~40 before any live trading.
 cooldown_ms             = 1500   # was 3000, which blocked 2 of 9 approvals
 kill_switch_file        = "KILL" # create this file to halt all entries immediately
 

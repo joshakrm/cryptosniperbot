@@ -116,11 +116,48 @@ impl Shadow {
         // candidates rather than varying with an intended position size.
         let probe = self.cfg.probe_size_sol.max(0.001);
 
-        let reference = match self.prices.mark(&mint, probe, decimals).await {
-            Ok(Some(p)) if p > 0.0 => p,
-            // No reference means nothing later can be expressed as a return.
-            other => {
-                debug!(%mint, ?other, "shadow: no reference price, dropping");
+        // Getting a reference price takes a few attempts: a launch is usually not
+        // routable the instant it is seen.
+        //
+        // Dropping the ones that never become routable would be a survivorship
+        // bias straight into the control group - it would keep only the
+        // candidates that were immediately tradeable, which is not a random
+        // sample of anything. Measured: 1410 candidates at 5% should have given
+        // ~70 records and gave 8. "Never routable" is an outcome, so it is
+        // recorded as one.
+        let mut reference = None;
+        for attempt in 0..4u32 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+            }
+            if let Ok(Some(p)) = self.prices.mark(&mint, probe, decimals).await {
+                if p > 0.0 {
+                    reference = Some(p);
+                    break;
+                }
+            }
+        }
+
+        let reference = match reference {
+            Some(p) => p,
+            None => {
+                debug!(%mint, "shadow: never became routable");
+                self.journal
+                    .write(
+                        "shadow",
+                        json!({
+                            "mint": mint,
+                            "venue": venue,
+                            "approved": verdict.approved,
+                            "post_exit": post_exit,
+                            "rejected_by": verdict.rejected_by,
+                            "pool_sol": verdict.pool_sol,
+                            "creator_share_pct": verdict.creator_share_pct,
+                            "never_routable": true,
+                            "observed_at": Utc::now().to_rfc3339(),
+                        }),
+                    )
+                    .await;
                 return;
             }
         };
@@ -164,6 +201,7 @@ impl Shadow {
                     "rejected_by": verdict.rejected_by,
                     "pool_sol": verdict.pool_sol,
                     "creator_share_pct": verdict.creator_share_pct,
+                    "never_routable": false,
                     "reference_price_sol": reference,
                     "marks": marks,
                     "peak_ret": if peak.is_finite() { Some(peak) } else { None },
