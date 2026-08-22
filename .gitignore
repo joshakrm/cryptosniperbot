@@ -6,3 +6,8 @@ KILL
 keypair.json
 *.key
 .env
+
+# Derived analysis caches - regenerate with scripts/graduation.py, never review a diff of them
+social_cache.json
+candidate_mints.json
+closed_mints.txt
