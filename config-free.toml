@@ -89,6 +89,18 @@ max_screen_ms      = 15000  # must exceed 3 x jupiter_max_interval_ms, or
 # all. The retry in rpc.rs covers the tail beyond this delay.
 min_pool_age_ms    = 0      # enter immediately; the whole point of the test
 
+# Re-check a pool-venue candidate rejected ONLY for outstanding LP, rather than
+# discarding it. A graduation burns its LP in a transaction AFTER the migration:
+# measured on 8 live ones, all 8 burned, median 498s later (min 67s, max 3466s).
+# Screening at t=0 therefore rejected every migration the bot ever saw - 598 of
+# them - on the venue whose shadowed candidates sit at a median +30% at t=900s
+# against -100% for pump_fun launches.
+# 20 polls at 60s covers 20 minutes and catches the median comfortably. Each
+# poll is one getTokenSupply, not a re-screen; the full screen runs once the
+# burn confirms and the candidate still has to pass every other check.
+lp_recheck_attempts      = 20
+lp_recheck_interval_secs = 60
+
 [risk]
 position_size_sol       = 0.25
 max_concurrent_positions = 12   # raised now that marks no longer starve

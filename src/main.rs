@@ -29,7 +29,7 @@ use crate::position::PositionManager;
 use crate::risk::RiskManager;
 use crate::rpc::{Jupiter, JupiterPrices, PriceSource, SolanaRpc};
 use crate::screen::{LaunchContext, Screener};
-use crate::types::Venue;
+use crate::types::{Severity, Venue};
 
 #[derive(Parser)]
 #[command(
@@ -359,9 +359,54 @@ async fn handle_candidate(ctx: CandidateCtx, hit: ingest::LogHit) -> Result<()> 
         },
     );
 
-    if !report.approved() {
-        info!(%mint, venue = ?hit.venue, "{}", report.summary());
-        return Ok(());
+    // A pool-venue candidate whose ONLY problem is an outstanding LP is not a
+    // rejected token, it is a token inspected too early.
+    //
+    // A graduation mints LP to the migrating party and burns it in a LATER
+    // transaction. Measured on 8 live migrations: all 8 burned, median 498s
+    // after the pool appeared, min 67s, max 3466s. Screening happens the
+    // instant the pool is seen, so the supply is always still live and the
+    // verdict is always reject - 598 of them in the journals, which is every
+    // migration this bot has ever seen, on the venue whose shadowed candidates
+    // sit at a median +30% at t=900s while pump_fun launches sit at -100%.
+    //
+    // So poll the LP supply instead of giving up. The poll is deliberately
+    // getTokenSupply only: a full re-screen costs three Jupiter quotes and the
+    // aggregator budget is the binding constraint at 26% screen timeouts. The
+    // full screen runs once, after the burn confirms, and still has to pass on
+    // its own merits - nothing here waives a check.
+    let mut report = report;
+    let pool_venue = hit.venue != Venue::PumpFun;
+    let mut rechecks = 0u32;
+    while !report.approved() {
+        let only_lp = {
+            let r = report.rejections();
+            r.len() == 1 && r[0].name == "lp_burned" && r[0].severity == Severity::Fatal
+        };
+        if !(pool_venue && only_lp && rechecks < ctx.cfg.screen.lp_recheck_attempts) {
+            info!(%mint, venue = ?hit.venue, "{}", report.summary());
+            return Ok(());
+        }
+        rechecks += 1;
+        tokio::time::sleep(Duration::from_secs(
+            ctx.cfg.screen.lp_recheck_interval_secs.max(1),
+        ))
+        .await;
+        let lp = screen::liquidity::check(
+            &ctx.rpc,
+            &ctx.cfg.screen,
+            launch.lp_mint.as_deref(),
+            &launch.other_mints,
+            hit.venue,
+        )
+        .await;
+        if !lp.iter().all(|c| c.passed) {
+            continue;
+        }
+        let waited = rechecks * ctx.cfg.screen.lp_recheck_interval_secs as u32;
+        info!(%mint, waited_s = waited, "LP burn confirmed - re-screening");
+        report = ctx.screener.screen(&mint, hit.venue, &launch).await;
+        ctx.journal.write_typed("screen", &report).await;
     }
 
     if ctx.pm.is_open(&mint).await {

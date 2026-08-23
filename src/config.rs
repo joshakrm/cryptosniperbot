@@ -140,7 +140,26 @@ pub struct ScreenConfig {
     pub treat_unavailable_as: UnavailablePolicy,
     #[serde(default)]
     pub min_pool_age_ms: u64,
+    /// How many times to re-check a pool-venue candidate that was rejected
+    /// ONLY because its LP was still outstanding. Zero disables it.
+    ///
+    /// A pump.fun graduation mints LP to the migrating party and burns it in a
+    /// LATER transaction, not in the migration itself. Measured on 8 live
+    /// migrations, all 8 burned, at a median of 498s after the pool appeared
+    /// (min 67s, max 3466s). The bot screens the instant it sees the pool, so
+    /// it reads a live LP supply every time and rejects - 598 of them across
+    /// the journals, which is every migration it has ever seen. The check is
+    /// right about the supply and wrong about the moment.
+    #[serde(default)]
+    pub lp_recheck_attempts: u32,
+    /// Seconds between those re-checks. Each one is a getTokenSupply, NOT a
+    /// full re-screen: the aggregator budget is the binding constraint and
+    /// three quotes per poll would spend it on candidates that are not yet
+    /// tradeable. The full screen runs once, after the burn confirms.
+    #[serde(default = "d_lp_recheck_secs")]
+    pub lp_recheck_interval_secs: u64,
 }
+fn d_lp_recheck_secs() -> u64 { 60 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RiskConfig {
