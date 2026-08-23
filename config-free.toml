@@ -142,7 +142,32 @@ kill_switch_file        = "KILL" # create this file to halt all entries immediat
 # Ladder: sell `pct` of the remaining position at each `gain_bps` level.
 # pct is a share of the ORIGINAL position size, not of what is left, so a
 # ladder summing to 100 fully exits. Anything over 100 is rejected at startup.
-# Single rung, chosen by replaying 263 recorded price paths through a grid of
+# Quick single rung, chosen by replaying 263 recorded price paths out-of-sample
+# (scripts/replay.py: rank on the earlier half by time, score on the later half).
+#
+#   take profit   out-of-sample mean   win rate
+#     +1%              -13.19%           25.6%
+#     +3%              -12.55%           33.1%
+#     +10%             -11.15%           28.9%   <- optimum
+#     +15%             -12.38%           24.8%
+#     +50%             -15.38%           14.0%   <- what this replaced
+#
+# It is a genuine interior optimum rather than "exit as fast as possible": +1%
+# is worse than +10%. And it survives removing the biggest winners - the margin
+# over the old +50% rung GROWS from 2.8pp to 5.3pp as the top five are dropped,
+# so the edge is in the body of the distribution, not the tail.
+#
+# The curve is FLAT between +3% and +20%, so the exact level is not well
+# determined; what the data says clearly is that +50% was far too far.
+#
+# THE STOP LOSS STAYS, and that is not a default - it was tested. The shadow
+# tracker follows positions after they close, and after this bot sells the
+# median position goes to -62.5% within 60s and -100% by 300s, with only 13-15%
+# ever trading back above the exit and 83% becoming unroutable entirely. There
+# is no recovery to hold on for. Removing the stop would have made this worse.
+#
+# (Superseded note, kept for the reasoning: the earlier single rung at +50% was
+# chosen by replaying 263 recorded price paths through a grid of
 # ladders, ranked on the earlier half and scored on the later half (scripts/
 # replay.py). Out-of-sample mean per position: -5.97% against -6.68% for the
 # two-rung ladder this replaced, and it stayed ahead by the same ~0.7pp with the
@@ -158,10 +183,16 @@ kill_switch_file        = "KILL" # create this file to halt all entries immediat
 # distribution has fatter tails than these 263 paths show, a policy that sells
 # everything at +50% is the wrong one.
 take_profit = [
-  { gain_bps = 5000,  pct = 100.0 },  # +50% -> close the whole position
+  { gain_bps = 1000, pct = 100.0 },   # +10% -> close the whole position
 ]
 stop_loss_bps     = 3500   # -35%
-trailing_stop_bps = 2500   # give back 25% from peak
+trailing_stop_bps = 0      # off. The replay that chose the +10% rung ran with
+                           # no trailing stop, and a trail cannot help a position
+                           # that closes the moment it is 10% up - it would only
+                           # fire on the ones that never get there, selling them
+                           # 25% below a peak that was already under water.
+                           # Set this back above zero only alongside a higher
+                           # take-profit, and re-run scripts/replay.py first.
 max_hold_secs     = 900    # hard timeout, 15 min
 poll_interval_ms  = 5000   # 4 positions / 5s = 0.8 marks/sec, leaving budget
                            # for screening. Wider sweeps mean worse stop fills:
