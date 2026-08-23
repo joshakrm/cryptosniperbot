@@ -193,7 +193,15 @@ trailing_stop_bps = 0      # off. The replay that chose the +10% rung ran with
                            # 25% below a peak that was already under water.
                            # Set this back above zero only alongside a higher
                            # take-profit, and re-run scripts/replay.py first.
-max_hold_secs     = 900    # hard timeout, 15 min
+max_hold_secs     = 60     # hard timeout, 60s. Replayed out-of-sample over 263
+                           # recorded paths at +10% TP / -35% stop:
+                           #    30s -11.69%   60s -10.50%   90s -10.97%
+                           #   120s -11.76%  300s -12.13%  900s -11.52%
+                           # A genuine optimum - both neighbours are worse. It
+                           # matches the shadow data: the median token is -66.7%
+                           # by t=60s and -100% by t=300s, so holding past a
+                           # minute is holding something already dead. Capital
+                           # turnover is the point, not patience.
 poll_interval_ms  = 5000   # 4 positions / 5s = 0.8 marks/sec, leaving budget
                            # for screening. Wider sweeps mean worse stop fills:
                            # a real cost, paid to keep screening working.
