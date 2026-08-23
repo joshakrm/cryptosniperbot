@@ -115,9 +115,23 @@ kill_switch_file        = "KILL" # create this file to halt all entries immediat
 # Ladder: sell `pct` of the remaining position at each `gain_bps` level.
 # pct is a share of the ORIGINAL position size, not of what is left, so a
 # ladder summing to 100 fully exits. Anything over 100 is rejected at startup.
+# Single rung, chosen by replaying 263 recorded price paths through a grid of
+# ladders, ranked on the earlier half and scored on the later half (scripts/
+# replay.py). Out-of-sample mean per position: -5.97% against -6.68% for the
+# two-rung ladder this replaced, and it stayed ahead by the same ~0.7pp with the
+# top one, two and three winners removed, so it is not one trade's artifact.
+#
+# Why the second rung hurt: of 28 positions that ever reached +50%, the median
+# peak was +152% and exactly HALF ever touched +150%. When it missed, half the
+# position rode back down to the trailing stop or the clock. Letting the
+# remainder trail instead scored worse still (-6.95%): it caught a bigger best
+# trade, +615% against +465%, and gave back 25% on every ordinary winner.
+#
+# This CAPS the tail on purpose, and that is the risk in it. If the real
+# distribution has fatter tails than these 263 paths show, a policy that sells
+# everything at +50% is the wrong one.
 take_profit = [
-  { gain_bps = 5000,  pct = 50.0 },   # +50%  -> sell half the original size
-  { gain_bps = 15000, pct = 50.0 },   # +150% -> sell the other half
+  { gain_bps = 5000,  pct = 100.0 },  # +50% -> close the whole position
 ]
 stop_loss_bps     = 3500   # -35%
 trailing_stop_bps = 2500   # give back 25% from peak
