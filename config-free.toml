@@ -74,7 +74,22 @@ require_lp_burned  = true
 # launch transaction that is fetched anyway. Measured over 225 live launches -
 # median pool 0.58 SOL - a 2.0 floor rejects 62% of candidates before they can
 # spend a single aggregator quote. Set 0.0 to disable.
-min_pool_sol       = 2.0
+min_pool_sol       = 5.0    # raised from 2.0 to stop pump_fun starving migrations.
+                            #
+                            # Measured over 45 minutes: pump_fun took 87% of the
+                            # Jupiter budget (242 of 277 routing screens) and its
+                            # median shadowed token is worth -100% at t=300s.
+                            # Migrations took 13%, sit at +30% at t=900s, and 28 of
+                            # 35 that passed the LP-burn recheck then failed on
+                            # screen_timeout or an unavailable quote - starved by
+                            # the venue that never pays.
+                            #
+                            # At this threshold, across 7145 journalled candidates:
+                            # pump_fun kept drops 27.3% -> 8.9%, migrations kept
+                            # 89.3% -> 89.0%. Two migrations out of 665 is the
+                            # entire cost of a two-thirds cut in wasted quotes.
+                            # This makes screening MORE selective; it disables no
+                            # safety check.
 require_holders    = false  # cannot run this early; see header
 max_roundtrip_loss_bps = 1500               # buy+sell round trip via Jupiter, 15%
                                             # quoted at risk.position_size_sol, the size
