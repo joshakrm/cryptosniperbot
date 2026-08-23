@@ -24,6 +24,10 @@ fn disqualified(checks: &[CheckResult]) -> bool {
 /// by hand from the CLI, where there is no transaction to read.
 #[derive(Debug, Clone, Default)]
 pub struct LaunchContext {
+    /// pump.fun bonding curve account, when the launch transaction named one.
+    /// Carried so positions can be priced off the curve instead of through the
+    /// aggregator that is this bot's binding constraint.
+    pub curve: Option<String>,
     /// The pool's token account for the base mint, so concentration can
     /// exclude exactly the pool instead of guessing positionally.
     pub vault: Option<String>,

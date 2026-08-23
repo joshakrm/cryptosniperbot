@@ -71,6 +71,27 @@ impl SolanaRpc {
         .await
     }
 
+    /// Raw account data, base64. Used for accounts the node cannot parse for
+    /// us - the pump.fun bonding curve among them.
+    pub async fn get_account_data(&self, address: &Pubkey) -> Result<Option<Vec<u8>>> {
+        let v = self
+            .call(
+                "getAccountInfo",
+                json!([address, { "encoding": "base64", "commitment": self.commitment }]),
+            )
+            .await?;
+        let data = v.get("value").and_then(|x| x.get("data"));
+        let encoded = match data.and_then(|d| d.as_array()).and_then(|a| a.first()) {
+            Some(x) => match x.as_str() {
+                Some(s) => s,
+                None => return Ok(None),
+            },
+            // A null value is a real answer: the account does not exist.
+            None => return Ok(None),
+        };
+        Ok(Some(crate::curve::base64_decode(encoded)?))
+    }
+
     /// Parsed mint account. Carries authorities, supply, decimals, and for
     /// Token-2022, the extension list.
     pub async fn get_mint_account(&self, mint: &Pubkey) -> Result<Value> {
@@ -373,7 +394,17 @@ impl Jupiter {
 /// Collapsing the last two lets an aggregator outage flatten the whole book.
 #[async_trait::async_trait]
 pub trait PriceSource: Send + Sync {
-    async fn mark(&self, mint: &str, tokens_held: f64, decimals: u8) -> Result<Option<f64>>;
+    /// `curve` is the pump.fun bonding curve account when one is known. Given
+    /// it, a price costs one getAccountInfo instead of a Jupiter quote, which
+    /// matters because the aggregator - not the RPC - is what this bot runs out
+    /// of. Implementations must still work without it.
+    async fn mark(
+        &self,
+        mint: &str,
+        tokens_held: f64,
+        decimals: u8,
+        curve: Option<&str>,
+    ) -> Result<Option<f64>>;
 }
 
 /// Live marks, priced against the size actually held so the number includes the
@@ -391,7 +422,13 @@ impl JupiterPrices {
 
 #[async_trait::async_trait]
 impl PriceSource for JupiterPrices {
-    async fn mark(&self, mint: &str, tokens_held: f64, decimals: u8) -> Result<Option<f64>> {
+    async fn mark(
+        &self,
+        mint: &str,
+        tokens_held: f64,
+        decimals: u8,
+        _curve: Option<&str>,
+    ) -> Result<Option<f64>> {
         let raw = ui_to_raw(tokens_held, decimals);
         if raw == 0 || tokens_held <= 0.0 {
             return Ok(None);
@@ -719,5 +756,59 @@ Connection: close
         let base = stub("200 OK", r#"{"inAmount":"1000","outAmount":"0"}"#).await;
         let r = jup(base).quote("A", "B", 1_000, 500, Priority::Screening).await;
         assert!(matches!(r, Ok(None)), "got {r:?}");
+    }
+}
+
+
+/// Prices from the bonding curve, falling back to the aggregator.
+///
+/// This exists to take Jupiter off the hot path. It was the binding constraint:
+/// roughly one quote per second against ~1300 candidates an hour, producing
+/// 18-26% screen timeouts, and a ~170ms third-party round trip in the middle of
+/// a path already 250x slower than the competitive benchmark.
+///
+/// A pump.fun token has exactly one venue and its price is a pure function of
+/// two numbers in one account, so an aggregator adds latency and a queue in
+/// exchange for nothing. When the curve cannot answer - a migrated token, an
+/// unreadable account, a venue that is not pump.fun - Jupiter still can, and the
+/// three-state contract is preserved through both: a real absence of liquidity
+/// is Ok(None), and a failure to find out is Err.
+pub struct CurveThenJupiter {
+    rpc: SolanaRpc,
+    fallback: JupiterPrices,
+}
+
+impl CurveThenJupiter {
+    pub fn new(rpc: SolanaRpc, fallback: JupiterPrices) -> Self {
+        Self { rpc, fallback }
+    }
+}
+
+#[async_trait::async_trait]
+impl PriceSource for CurveThenJupiter {
+    async fn mark(
+        &self,
+        mint: &str,
+        tokens_held: f64,
+        decimals: u8,
+        curve: Option<&str>,
+    ) -> Result<Option<f64>> {
+        if let Some(addr) = curve {
+            // A missing account or a failed read is not evidence about the
+            // token, so either falls through to the aggregator rather than
+            // becoming a verdict.
+            if let Ok(Some(data)) = self.rpc.get_account_data(&addr.to_string()).await {
+                if let Ok(bc) = crate::curve::BondingCurve::parse(&data) {
+                    // A completed curve has migrated and prices nothing; fall
+                    // through so the pool venue can be quoted instead.
+                    if !bc.complete {
+                        if let Some(p) = bc.sell_price(tokens_held, decimals) {
+                            return Ok(Some(p));
+                        }
+                    }
+                }
+            }
+        }
+        self.fallback.mark(mint, tokens_held, decimals, None).await
     }
 }

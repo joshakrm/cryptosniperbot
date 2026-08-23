@@ -182,26 +182,26 @@ kill_switch_file        = "KILL" # create this file to halt all entries immediat
 # This CAPS the tail on purpose, and that is the risk in it. If the real
 # distribution has fatter tails than these 263 paths show, a policy that sells
 # everything at +50% is the wrong one.
+# REVERTED from +10% back to +50% after live results contradicted the replay.
+#
+# The replay ranked +10% best out-of-sample (-11.15% against -15.38%). Live over
+# 162 trades it raised the win rate 9.1% -> 13.6% and collapsed the win/loss
+# ratio 5.63x -> 0.91x, leaving the mean per trade IDENTICAL at -0.0451 SOL. It
+# capped every winner at +10% while losers still ran to the -35% stop, trading
+# rate for ratio almost exactly one for one. At 0.91x break-even needs a 52% win
+# rate; at 5.63x it needs 15%. Structurally worse, for no gain.
+#
+# WHY THE REPLAY WAS WRONG, because the tooling is still sound: it was fitted on
+# paths recorded under min_pool_sol = 2.0, a different candidate mix entirely.
+# The out-of-sample split protects against fitting noise WITHIN a distribution;
+# it does nothing about being applied to a different one. Re-fit replay.py on
+# paths from the config you are actually running before trusting it again.
 take_profit = [
-  { gain_bps = 1000, pct = 100.0 },   # +10% -> close the whole position
+  { gain_bps = 5000, pct = 100.0 },   # +50% -> close the whole position
 ]
 stop_loss_bps     = 3500   # -35%
-trailing_stop_bps = 0      # off. The replay that chose the +10% rung ran with
-                           # no trailing stop, and a trail cannot help a position
-                           # that closes the moment it is 10% up - it would only
-                           # fire on the ones that never get there, selling them
-                           # 25% below a peak that was already under water.
-                           # Set this back above zero only alongside a higher
-                           # take-profit, and re-run scripts/replay.py first.
-max_hold_secs     = 60     # hard timeout, 60s. Replayed out-of-sample over 263
-                           # recorded paths at +10% TP / -35% stop:
-                           #    30s -11.69%   60s -10.50%   90s -10.97%
-                           #   120s -11.76%  300s -12.13%  900s -11.52%
-                           # A genuine optimum - both neighbours are worse. It
-                           # matches the shadow data: the median token is -66.7%
-                           # by t=60s and -100% by t=300s, so holding past a
-                           # minute is holding something already dead. Capital
-                           # turnover is the point, not patience.
+trailing_stop_bps = 2500   # give back 25% from peak
+max_hold_secs     = 900    # hard timeout, 15 min
 poll_interval_ms  = 5000   # 4 positions / 5s = 0.8 marks/sec, leaving budget
                            # for screening. Wider sweeps mean worse stop fills:
                            # a real cost, paid to keep screening working.

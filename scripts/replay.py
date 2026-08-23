@@ -20,6 +20,20 @@ that best fits that dataset's noise. Paths are therefore split by time: policies
 are ranked on the earlier half and reported on the later half, which they had no
 part in choosing. The out-of-sample column is the only one worth reading.
 
+AND THE SPLIT DOES NOT PROTECT YOU FROM A CHANGE OF DISTRIBUTION, which is how
+this script has already been wrong once. It ranked a +10% take-profit best
+out-of-sample, -11.15% against -15.38% for +50%. Shipped, it raised the live win
+rate 9.1% -> 13.6% and collapsed the win/loss ratio 5.63x -> 0.91x, leaving the
+mean per trade identical. The paths it learned from were recorded under
+min_pool_sol = 2.0; the config it was applied to screened at 5.0 and saw a
+different candidate mix entirely. A time split defends against fitting noise
+WITHIN a distribution and says nothing about being carried into another one.
+
+So: re-record paths under the config you actually intend to run, and re-fit on
+those. The script now prints which journals it read and warns when they span
+more than one screening config, but it cannot detect every such change - that
+judgement stays with you.
+
 Usage:  python3 scripts/replay.py [--all] [journal.jsonl ...]
 """
 import glob
@@ -162,6 +176,17 @@ def main():
     if not paths:
         print("No mark records found. Run the bot with journalling first.")
         return 1
+
+    # Name the sources. A policy fitted across journals recorded under different
+    # screening configs is fitted across different populations, and that has
+    # already produced one wrong shipped answer.
+    print("")
+    print(" reading: %s" % ", ".join(files))
+    if len(files) > 1:
+        print(" NOTE: multiple journals. If they were recorded under different")
+        print(" screening configs - a different min_pool_sol, a different venue")
+        print(" mix - they are different populations and a policy fitted across")
+        print(" them describes none of them. Re-record under one config first.")
 
     complete = {m: v for m, v in paths.items() if v[1][-1][0] >= 870}
     chosen = paths if use_all else complete

@@ -161,6 +161,12 @@ pub struct Position {
     pub mint: Pubkey,
     pub venue: Venue,
     pub decimals: u8,
+    /// pump.fun bonding curve account, when the launch transaction named one.
+    /// Present so marks can be priced from the curve with a single
+    /// getAccountInfo instead of a Jupiter quote - the aggregator, not the RPC,
+    /// is what this bot runs out of. None simply means the aggregator is used.
+    #[serde(default)]
+    pub curve: Option<String>,
     pub opened_at: DateTime<Utc>,
     pub entry_price_sol: f64,
     pub tokens_held: f64,
@@ -208,6 +214,7 @@ mod tests {
 
     fn pos() -> Position {
         Position {
+            curve: None,
             mint: "M".into(),
             venue: Venue::PumpFun,
             decimals: 6,

@@ -76,12 +76,13 @@ impl Shadow {
         venue: Venue,
         decimals: u8,
         verdict: ShadowVerdict,
+        curve: Option<String>,
     ) {
         if !self.cfg.enabled {
             return;
         }
         tokio::spawn(async move {
-            self.follow(mint, venue, decimals, verdict, true).await;
+            self.follow(mint, venue, decimals, verdict, curve, true).await;
         });
     }
 
@@ -95,12 +96,13 @@ impl Shadow {
         venue: Venue,
         decimals: u8,
         verdict: ShadowVerdict,
+        curve: Option<String>,
     ) {
         if !self.selects(&mint) {
             return;
         }
         tokio::spawn(async move {
-            self.follow(mint, venue, decimals, verdict, false).await;
+            self.follow(mint, venue, decimals, verdict, curve, false).await;
         });
     }
 
@@ -110,6 +112,7 @@ impl Shadow {
         venue: Venue,
         decimals: u8,
         verdict: ShadowVerdict,
+        curve: Option<String>,
         post_exit: bool,
     ) {
         // A fixed notional for every shadow, so the prices are comparable across
@@ -130,7 +133,7 @@ impl Shadow {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_secs(15)).await;
             }
-            if let Ok(Some(p)) = self.prices.mark(&mint, probe, decimals).await {
+            if let Ok(Some(p)) = self.prices.mark(&mint, probe, decimals, curve.as_deref()).await {
                 if p > 0.0 {
                     reference = Some(p);
                     break;
@@ -171,7 +174,7 @@ impl Shadow {
             tokio::time::sleep(Duration::from_secs(*at - elapsed)).await;
             elapsed = *at;
 
-            let price = match self.prices.mark(&mint, probe, decimals).await {
+            let price = match self.prices.mark(&mint, probe, decimals, curve.as_deref()).await {
                 Ok(Some(p)) if p > 0.0 => Some(p),
                 // A zero/negative price and no route are the same outcome, and
                 // for a control group that outcome is data, not a missing value.
@@ -239,7 +242,7 @@ mod tests {
         struct Never;
         #[async_trait::async_trait]
         impl PriceSource for Never {
-            async fn mark(&self, _: &str, _: f64, _: u8) -> anyhow::Result<Option<f64>> {
+            async fn mark(&self, _: &str, _: f64, _: u8, _: Option<&str>) -> anyhow::Result<Option<f64>> {
                 Ok(None)
             }
         }

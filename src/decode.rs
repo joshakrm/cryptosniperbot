@@ -213,6 +213,53 @@ pub fn extract_other_mints(tx: &Value, base_mint: &str, quote_mints: &[&str]) ->
 /// Without this, concentration has to exclude the largest holder positionally,
 /// which drops a whale whenever a whale outranks the vault. That is exactly the
 /// shape of the rug the check exists to catch.
+/// The bonding curve account that holds a pump.fun token's reserves.
+///
+/// In the launch transaction the token account holding the supply is owned by
+/// the curve PDA, so the `owner` field of that balance IS the curve. Reading it
+/// here avoids deriving the PDA, which would mean pulling in sha256 and base58
+/// for one address the transaction already states.
+///
+/// Wanted because pricing off the curve replaces a Jupiter round trip - the
+/// binding constraint on this bot - with one getAccountInfo. See src/curve.rs.
+pub fn extract_bonding_curve(tx: &Value, mint: &str) -> Option<Pubkey> {
+    let meta = tx.get("meta")?;
+    let fee_payer = extract_creator(tx);
+
+    let mut best: Option<(u128, String)> = None;
+    for key in ["postTokenBalances", "preTokenBalances"] {
+        let arr = match meta.get(key).and_then(|v| v.as_array()) {
+            Some(a) => a,
+            None => continue,
+        };
+        for entry in arr {
+            if entry.get("mint").and_then(|v| v.as_str()) != Some(mint) {
+                continue;
+            }
+            let owner = match entry.get("owner").and_then(|v| v.as_str()) {
+                Some(o) => o,
+                None => continue,
+            };
+            // The creator's own balance is not the curve.
+            if Some(owner) == fee_payer.as_deref() {
+                continue;
+            }
+            let amount = entry
+                .get("uiTokenAmount")
+                .and_then(|v| v.get("amount"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<u128>().ok())
+                .unwrap_or(0);
+            // The curve holds the supply; take the largest third-party balance
+            // so a stray dust account cannot be mistaken for it.
+            if best.as_ref().map(|(a, _)| amount > *a).unwrap_or(true) {
+                best = Some((amount, owner.to_string()));
+            }
+        }
+    }
+    best.and_then(|(amount, owner)| if amount > 0 { Some(owner) } else { None })
+}
+
 pub fn extract_vault_account(tx: &Value, mint: &str) -> Option<Pubkey> {
     let meta = tx.get("meta")?;
     let fee_payer = extract_creator(tx);

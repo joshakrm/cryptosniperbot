@@ -13,7 +13,7 @@ use crate::journal::Journal;
 use crate::risk::RiskManager;
 use crate::rpc::PriceSource;
 use crate::shadow::{Shadow, ShadowVerdict};
-use crate::types::{ExitReason, Position, Venue};
+use crate::types::{ExitReason, Fill, Position, Venue};
 
 /// Consecutive sweeps with no sell route before a position is written off.
 ///
@@ -74,6 +74,7 @@ impl PositionManager {
                 approved: true,
                 ..Default::default()
             },
+            pos.curve.clone(),
         );
     }
 
@@ -85,24 +86,30 @@ impl PositionManager {
         self.positions.lock().await.len()
     }
 
+    /// Record a filled entry. Takes the Fill rather than its fields unpacked:
+    /// entry price, token amount and cost all come from the same object, and
+    /// passing them separately invites a caller to mix a price from one fill
+    /// with a size from another.
     pub async fn open(
         &self,
         mint: String,
         venue: Venue,
         decimals: u8,
-        entry_price: f64,
-        tokens: f64,
-        sol_invested: f64,
+        curve: Option<String>,
+        fill: &Fill,
     ) {
+        let entry_price = fill.price_sol;
+        let tokens = fill.token_amount;
         let pos = Position {
             mint: mint.clone(),
             venue,
             decimals,
+            curve,
             opened_at: Utc::now(),
             entry_price_sol: entry_price,
             tokens_held: tokens,
             tokens_initial: tokens,
-            sol_invested,
+            sol_invested: fill.sol_amount + fill.fees_sol,
             sol_realised: 0.0,
             peak_price_sol: entry_price,
             next_rung: 0,
@@ -198,7 +205,7 @@ impl PositionManager {
     async fn mark_price(&self, pos: &Position) -> Mark {
         match self
             .prices
-            .mark(&pos.mint, pos.tokens_held, pos.decimals)
+            .mark(&pos.mint, pos.tokens_held, pos.decimals, pos.curve.as_deref())
             .await
         {
             Ok(Some(p)) => Mark::Price(p),
@@ -494,6 +501,7 @@ mod tests {
     /// Entry at 1.0 SOL/token, 1000 tokens, nothing sold yet.
     fn pos() -> Position {
         Position {
+            curve: None,
             mint: "M".into(),
             venue: Venue::PumpFun,
             decimals: 6,
@@ -536,7 +544,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl PriceSource for StubPrices {
-        async fn mark(&self, _mint: &str, _held: f64, _dec: u8) -> Result<Option<f64>> {
+        async fn mark(&self, _mint: &str, _held: f64, _dec: u8, _curve: Option<&str>) -> Result<Option<f64>> {
             let tick = match self.ticks.lock().await.pop_front() {
                 Some(t) => {
                     *self.last.lock().await = t;
@@ -610,7 +618,10 @@ mod tests {
     /// Entry at 1.0 SOL/token, 1000 tokens, 1000 SOL in.
     async fn opened(pm: &PositionManager, risk: &RiskManager) {
         assert!(risk.try_enter().await.allowed());
-        pm.open("M".into(), Venue::PumpFun, 6, 1.0, 1_000.0, 1_000.0).await;
+        pm.open("M".into(), Venue::PumpFun, 6, None, &Fill {
+            mint: "M".into(), is_buy: true, sol_amount: 1_000.0,
+            token_amount: 1_000.0, price_sol: 1.0, fees_sol: 0.0, at: Utc::now(),
+        }).await;
     }
 
     #[tokio::test]
@@ -755,7 +766,10 @@ mod tests {
         std::fs::write(&kill, b"stop").unwrap();
 
         let (pm, risk) = harness_with(vec![Some(Some(1.2))], kill.display().to_string()).await;
-        pm.open("M".into(), Venue::PumpFun, 6, 1.0, 1_000.0, 1_000.0).await;
+        pm.open("M".into(), Venue::PumpFun, 6, None, &Fill {
+            mint: "M".into(), is_buy: true, sol_amount: 1_000.0,
+            token_amount: 1_000.0, price_sol: 1.0, fees_sol: 0.0, at: Utc::now(),
+        }).await;
 
         pm.sweep().await.unwrap();
         assert_eq!(pm.open_count().await, 0, "kill switch must flatten everything");
@@ -793,7 +807,10 @@ mod tests {
         // 0.003 tokens worth 0.0048 SOL - under the 0.005 dust threshold.
         let (pm, risk) = harness(vec![Some(Some(1.6))]).await;
         assert!(risk.try_enter().await.allowed());
-        pm.open("M".into(), Venue::PumpFun, 6, 1.0, 0.006, 0.006).await;
+        pm.open("M".into(), Venue::PumpFun, 6, None, &Fill {
+            mint: "M".into(), is_buy: true, sol_amount: 0.006,
+            token_amount: 0.006, price_sol: 1.0, fees_sol: 0.0, at: Utc::now(),
+        }).await;
 
         pm.sweep().await.unwrap();
         assert_eq!(pm.open_count().await, 0, "dust must not be chased");

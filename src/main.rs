@@ -1,4 +1,5 @@
 mod config;
+mod curve;
 mod decode;
 mod exec;
 mod ingest;
@@ -27,7 +28,7 @@ use crate::exec::Executor;
 use crate::journal::Journal;
 use crate::position::PositionManager;
 use crate::risk::RiskManager;
-use crate::rpc::{Jupiter, JupiterPrices, PriceSource, SolanaRpc};
+use crate::rpc::{CurveThenJupiter, Jupiter, JupiterPrices, PriceSource, SolanaRpc};
 use crate::screen::{LaunchContext, Screener};
 use crate::types::{Severity, Venue};
 
@@ -142,9 +143,11 @@ async fn run(config_path: &Path, journal_path: &Path) -> Result<()> {
     let paper = Arc::new(PaperExecutor::new(cfg.paper.clone()));
     let executor: Arc<dyn Executor> = paper.clone();
 
-    let prices: Arc<dyn PriceSource> = Arc::new(JupiterPrices::new(
-        jup.clone(),
-        cfg.programs.wsol_mint.clone(),
+    // Curve first, aggregator second. Jupiter was the binding constraint at
+    // ~1 quote/sec; a pump.fun price is two numbers in one account.
+    let prices: Arc<dyn PriceSource> = Arc::new(CurveThenJupiter::new(
+        SolanaRpc::new(&cfg.rpc)?,
+        JupiterPrices::new(jup.clone(), cfg.programs.wsol_mint.clone()),
     ));
     let shadow = Arc::new(crate::shadow::Shadow::new(
         prices.clone(),
@@ -331,6 +334,7 @@ async fn handle_candidate(ctx: CandidateCtx, hit: ingest::LogHit) -> Result<()> 
     }
 
     let launch = LaunchContext {
+        curve: decode::extract_bonding_curve(&tx, &mint),
         vault: decode::extract_vault_account(&tx, &mint),
         lp_mint: decode::extract_lp_mint(&tx, &mint, &quote_mints),
         other_mints: decode::extract_other_mints(&tx, &mint, &quote_mints),
@@ -357,6 +361,7 @@ async fn handle_candidate(ctx: CandidateCtx, hit: ingest::LogHit) -> Result<()> 
             pool_sol: launch.pool_sol,
             creator_share_pct,
         },
+        launch.curve.clone(),
     );
 
     // A pool-venue candidate whose ONLY problem is an outstanding LP is not a
@@ -451,9 +456,8 @@ async fn handle_candidate(ctx: CandidateCtx, hit: ingest::LogHit) -> Result<()> 
                     mint.clone(),
                     hit.venue,
                     decimals,
-                    fill.price_sol,
-                    fill.token_amount,
-                    fill.sol_amount + fill.fees_sol,
+                    launch.curve.clone(),
+                    &fill,
                 )
                 .await;
 
