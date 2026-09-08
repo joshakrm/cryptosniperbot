@@ -3,9 +3,23 @@
 
 Copy-trading needs a list of wallets. This builds one from Solana history alone -
 no third-party service, no leaderboard, nothing whose terms govern what we may
-read. The outcome label comes from the bonding curve account itself, which
-carries a `complete` flag once the curve has filled: an on-chain fact, one
-getAccountInfo per token.
+read.
+
+CASE-CONTROL SAMPLING, because the outcome is rare. A random sample of 240
+launches produced 129 readable tokens and SIX winners - a 4.7% base rate, which
+would need ~640 readable tokens to yield 30 winners, or about eight hours
+against an endpoint that fails 37% of calls. So winners and losers are drawn
+separately: every known graduation, plus a matched set of launches that did not
+graduate. The absolute base rate then reflects the sampling ratio rather than
+the wild, which is fine - the permutation test asks whether chance could produce
+this hit rate GIVEN this mix, and that question is unaffected.
+
+THE WINNER LABEL is the venue a token was seen on. A pump_swap candidate is a
+migration, and a migration is a curve that filled. But only 24% of 1191 observed
+migrations carry the pump suffix - the rest are ordinary PumpSwap pools someone
+opened by hand at 0.1 or 7 or 800 SOL - so a winner must ALSO have moved a
+canonical graduation's worth of liquidity, >50 SOL. That leaves 186. Counting a
+5 SOL hand-made pool as a graduation would label ordinary tokens as successes.
 
 THE METHOD, AND WHY EACH PART IS THERE.
 
@@ -32,14 +46,13 @@ what was asked for, and a token that could not be read is dropped from BOTH the
 numerator and the denominator rather than counted as a miss.
 
 Usage:
-    python3 scripts/rank_wallets.py [n_tokens] [early_n]
+    python3 scripts/rank_wallets.py [n_losers] [early_n]
 """
 import collections
 import io
 import json
 import os
 import random
-import struct
 import sys
 import time
 
@@ -50,13 +63,15 @@ except ImportError:                                    # pragma: no cover
     from urllib2 import Request, urlopen, HTTPError
 
 OFFICIAL = "https://api.mainnet-beta.solana.com"
-CURVE_CACHE = "curve_outcomes.json"
 BUYER_CACHE = "early_buyers.json"
 
 # Measured on this endpoint: a batch of 10 returns ~4 tx/sec, 25 returns partial,
 # 50 answers 429. Small batches with a pause beat large ones that fail.
 BATCH = 10
 PAUSE = 1.2
+# Pagination must reach a token's first transaction; see early_buyers for why a
+# cap that some tokens hit and others do not is worse than no analysis at all.
+MAX_PAGES = 14
 
 
 class Rpc(object):
@@ -135,10 +150,17 @@ class Rpc(object):
         return out
 
 
-def journal_mints():
-    """pump.fun mints this bot has seen, newest first, with the time seen."""
+def sample(n_losers):
+    """Winners and losers, drawn separately because graduations are rare.
+
+    A winner is a token seen migrating with a canonical graduation's liquidity:
+    the pump suffix AND more than 50 SOL moved into the pool. Measured on 1191
+    observed migrations, only 335 carry the suffix and 186 satisfy both - the
+    remainder are hand-opened PumpSwap pools at arbitrary sizes and are not
+    evidence of anything having gone up.
+    """
     import glob
-    seen = {}
+    winners, losers = {}, {}
     for p in glob.glob("journal*.jsonl"):
         for line in io.open(p, encoding="utf-8", errors="replace"):
             line = line.strip()
@@ -151,90 +173,75 @@ def journal_mints():
             if r.get("kind") != "candidate":
                 continue
             d = r["data"]
-            if d.get("venue") != "pump_fun":
+            ts, mint, venue = r.get("ts", ""), d.get("mint"), d.get("venue")
+            if not mint:
                 continue
-            seen.setdefault(d["mint"], (r.get("ts", ""), d.get("signature")))
-    return seen
+            if venue == "pump_swap":
+                if mint.endswith("pump") and (d.get("pool_sol") or 0) > 50:
+                    winners.setdefault(mint, ts)
+            elif venue == "pump_fun":
+                losers.setdefault(mint, ts)
+    for m in winners:
+        losers.pop(m, None)
+    lo = sorted(losers.items(), key=lambda kv: kv[1])
+    if len(lo) > n_losers:                      # spread across the whole period
+        step = len(lo) / float(n_losers)
+        lo = [lo[int(i * step)] for i in range(n_losers)]
+    rows = [(ts, m, True) for m, ts in winners.items()]
+    rows += [(ts, m, False) for m, ts in lo]
+    rows.sort()
+    return rows
 
 
-def curve_outcome(rpc, mint, sig, cache):
-    """(complete, curve_address) for a mint, read from the chain.
+def early_buyers(rpc, mint, n, cache):
+    """The first `n` distinct signers to touch this mint, deployer excluded.
 
-    `complete` means the bonding curve filled - roughly 85 SOL of net buying and
-    a large move up. It is the honest on-chain outcome label and needs no
-    third-party service.
+    Keyed on the MINT rather than the bonding curve: the earliest transactions
+    mentioning a mint are its creation and the first buys, which is what we
+    want, and it removes the curve-address lookup entirely. That matters at 37%
+    RPC failures, where every avoidable call is one more chance to lose a token.
+
+    IT MUST REACH THE ACTUAL FIRST TRANSACTION OR GIVE UP. An earlier version
+    capped pagination at 4 pages and returned whatever it had. Graduated tokens
+    carry far more history than failed ones, so that cap was reached on half the
+    winners and none of the losers - meaning winners contributed their MID-LIFE
+    traders and losers their genuine early buyers. Two different populations,
+    compared as though they were one. It produced a 96.8% out-of-sample hit rate
+    against a 38% base rate at p=0.000: a spectacular result, and entirely an
+    artefact of who gets sampled rather than of anyone's skill.
+
+    So the walk now runs to exhaustion, and a token whose beginning cannot be
+    reached returns None and leaves the sample. That drops the busiest
+    graduations, which is a real and acknowledged bias - but it is a bias on an
+    observable property, applied to both arms, rather than a silent swap of one
+    population for another.
     """
-    if mint in cache:
-        return cache[mint]
-    tx = rpc.one("getTransaction",
-                 [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
-    if not tx:
-        return None                      # could not read: not an outcome
-    meta = tx.get("meta") or {}
-    keys = tx.get("transaction", {}).get("message", {}).get("accountKeys", [])
-    payer = next((k.get("pubkey") for k in keys if k.get("signer")), None)
-    curve, best = None, 0
-    for b in (meta.get("postTokenBalances") or []):
-        if b.get("mint") != mint:
-            continue
-        owner = b.get("owner")
-        if not owner or owner == payer:
-            continue
-        try:
-            amt = int((b.get("uiTokenAmount") or {}).get("amount") or 0)
-        except (TypeError, ValueError):
-            amt = 0
-        if amt > best:
-            best, curve = amt, owner
-    if not curve:
-        return None
-    acct = rpc.one("getAccountInfo", [curve, {"encoding": "base64"}])
-    val = (acct or {}).get("value")
-    if not val:
-        # A closed account means the curve completed and migrated.
-        cache[mint] = [True, curve]
-        return cache[mint]
-    import base64
-    raw = base64.b64decode(val["data"][0])
-    if len(raw) < 49:
-        return None
-    complete = raw[48] != 0
-    cache[mint] = [bool(complete), curve]
-    return cache[mint]
-
-
-def early_buyers(rpc, mint, curve, n, cache):
-    """The first `n` distinct signers to trade this curve, in order.
-
-    Index 0 is the creation transaction, so the deployer is dropped: following
-    whoever made the token is not copy-trading, and the standout wallet in an
-    earlier version of this analysis was exactly that.
-    """
-    key = "%s:%d" % (curve, n)
+    key = "%s:%d" % (mint, n)
     if key in cache:
         return cache[key]
-    # walk back to the beginning of the curve's history
-    before, page, pages = None, None, 0
-    while pages < 6:
-        params = [curve, {"limit": 1000}]
+    before, page, pages, reached = None, None, 0, False
+    while pages < MAX_PAGES:
+        params = [mint, {"limit": 1000}]
         if before:
             params[1]["before"] = before
         got = rpc.one("getSignaturesForAddress", params)
         if got is None:
-            return None                  # RPC failure, not an empty history
+            return None                         # failure, not an empty history
         if not got:
+            reached = True
             break
         page = got
         pages += 1
         if len(got) < 1000:
+            reached = True
             break
         before = got[-1]["signature"]
-    if not page:
+    if not page or not reached:
         return None
     sigs = [s["signature"] for s in page[-(n + 1):]]
     txs = rpc.batch_tx(sigs)
     if len(txs) < max(2, len(sigs) // 2):
-        return None                      # too much of it missing to trust
+        return None                             # too much missing to trust
     ordered = []
     for s in sigs:
         tx = txs.get(s)
@@ -244,52 +251,46 @@ def early_buyers(rpc, mint, curve, n, cache):
         signer = next((k.get("pubkey") for k in keys if k.get("signer")), None)
         if signer and signer not in ordered:
             ordered.append(signer)
-    cache[key] = ordered[1:]             # drop the deployer
+    cache[key] = ordered[1:]                    # drop the deployer
     return cache[key]
 
 
 def main():
-    n_tokens = int(sys.argv[1]) if len(sys.argv) > 1 else 240
-    early_n = int(sys.argv[2]) if len(sys.argv) > 2 else 20
+    n_losers = int(sys.argv[1]) if len(sys.argv) > 1 else 260
+    early_n = int(sys.argv[2]) if len(sys.argv) > 2 else 12
 
-    curves = json.load(io.open(CURVE_CACHE)) if os.path.exists(CURVE_CACHE) else {}
     buyers = json.load(io.open(BUYER_CACHE)) if os.path.exists(BUYER_CACHE) else {}
-
-    seen = journal_mints()
-    ordered = sorted(seen.items(), key=lambda kv: kv[1][0])   # oldest first
-    ordered = [(m, ts, sig) for m, (ts, sig) in ordered if sig]
-    if len(ordered) > n_tokens:
-        step = len(ordered) / float(n_tokens)
-        ordered = [ordered[int(i * step)] for i in range(n_tokens)]
+    picked = sample(n_losers)
 
     rpc = Rpc()
     print("")
     print("=" * 78)
-    print(" wallet ranking: %d tokens, %d early buyers each" % (len(ordered), early_n))
+    print(" wallet ranking: %d tokens (%d graduations, %d not), %d early buyers each"
+          % (len(picked), sum(1 for _, _, w in picked if w),
+             sum(1 for _, _, w in picked if not w), early_n))
     print("=" * 78)
-    print(" outcome label: the bonding curve's own `complete` flag, read on chain")
+    print(" label: a migration with the pump suffix and >50 SOL is a filled curve")
 
     rows = []
-    for i, (mint, ts, sig) in enumerate(ordered):
-        out = curve_outcome(rpc, mint, sig, curves)
-        if not out:
-            continue
-        complete, curve = out
-        eb = early_buyers(rpc, mint, curve, early_n, buyers)
+    dropped = {"win": 0, "lose": 0}
+    for i, (ts, mint, won) in enumerate(picked):
+        eb = early_buyers(rpc, mint, early_n, buyers)
         if eb is None:
+            dropped["win" if won else "lose"] += 1
             continue
-        rows.append((ts, mint, bool(complete), eb))
-        if (i + 1) % 20 == 0:
-            json.dump(curves, io.open(CURVE_CACHE, "w"))
+        rows.append((ts, mint, won, eb))
+        if (i + 1) % 25 == 0:
             json.dump(buyers, io.open(BUYER_CACHE, "w"))
             print("   ... %d/%d processed, %d usable, %d rpc failures"
-                  % (i + 1, len(ordered), len(rows), rpc.failures))
-    json.dump(curves, io.open(CURVE_CACHE, "w"))
+                  % (i + 1, len(picked), len(rows), rpc.failures))
     json.dump(buyers, io.open(BUYER_CACHE, "w"))
 
     print("")
     print(" tokens read: %d of %d attempted   (%d rpc calls, %d failed)"
-          % (len(rows), len(ordered), rpc.calls, rpc.failures))
+          % (len(rows), len(picked), rpc.calls, rpc.failures))
+    print(" dropped unread: %d graduations, %d non-graduations" % (dropped["win"], dropped["lose"]))
+    print(" (a token whose FIRST transaction could not be reached is dropped, so")
+    print("  both arms contribute genuine early buyers or nothing at all)")
     if len(rows) < 40:
         print("")
         print(" Too few tokens were readable to conclude anything. This is an")
@@ -297,8 +298,9 @@ def main():
         return 2
 
     wins = sum(1 for _, _, c, _ in rows if c)
-    print(" of those, %d filled their curve (%.1f%% base rate)"
+    print(" of those, %d are graduations (%.1f%% of the SAMPLE, which is a"
           % (wins, 100.0 * wins / len(rows)))
+    print(" sampling ratio by construction, not the rate in the wild)")
     if wins < 10:
         print("")
         print(" Fewer than 10 winners in the sample. Nothing can be ranked against")
