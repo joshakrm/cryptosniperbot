@@ -33,8 +33,25 @@ pub struct LogHit {
 pub async fn run(cfg: Config, tx: mpsc::Sender<LogHit>) -> Result<()> {
     let mut backoff_ms: u64 = 500;
 
+    // Endpoints to rotate through on reconnect. A deaf endpoint is not fixed by
+    // reconnecting to the same deaf endpoint, and the failure is silent by
+    // nature - measured on publicnode, subscriptions accepted and nothing
+    // delivered for as long as anyone cared to wait.
+    let mut endpoints = vec![cfg.rpc.ws_url.clone()];
+    if let Some(fb) = cfg.rpc.ws_fallback_url.clone() {
+        if fb != cfg.rpc.ws_url {
+            endpoints.push(fb);
+        }
+    }
+    let mut which = 0usize;
+
     loop {
-        match connect_and_stream(&cfg, &tx).await {
+        let url = endpoints[which % endpoints.len()].clone();
+        if endpoints.len() > 1 {
+            info!(endpoint = %url, "connecting");
+        }
+        which += 1;
+        match connect_and_stream(&cfg, &tx, &url).await {
             Ok(()) => {
                 warn!("log stream ended, reconnecting");
                 backoff_ms = 500;
@@ -48,7 +65,11 @@ pub async fn run(cfg: Config, tx: mpsc::Sender<LogHit>) -> Result<()> {
     }
 }
 
-async fn connect_and_stream(cfg: &Config, out: &mpsc::Sender<LogHit>) -> Result<()> {
+async fn connect_and_stream(
+    cfg: &Config,
+    out: &mpsc::Sender<LogHit>,
+    ws_url: &str,
+) -> Result<()> {
     let mut watched = cfg.programs.watched()?;
 
     // Followed wallets subscribe through the same filter as programs: Solana's
@@ -64,7 +85,7 @@ async fn connect_and_stream(cfg: &Config, out: &mpsc::Sender<LogHit>) -> Result<
         watched.push((format!("wallet:{addr}"), addr.clone()));
     }
 
-    let (ws, _) = tokio_tungstenite::connect_async(cfg.rpc.ws_url.as_str())
+    let (ws, _) = tokio_tungstenite::connect_async(ws_url)
         .await
         .context("websocket connect failed")?;
     let (mut writer, mut reader) = ws.split();
@@ -117,7 +138,11 @@ async fn connect_and_stream(cfg: &Config, out: &mpsc::Sender<LogHit>) -> Result<
     // program subscriptions at roughly 1750 pump.fun launches an hour, five
     // minutes of genuine silence does not happen; if it does, a needless
     // reconnect costs a few hundred milliseconds and being deaf costs the run.
-    const DATA_TIMEOUT: Duration = Duration::from_secs(300);
+    // 5 minutes was far too generous. A healthy pump.fun subscription delivers
+    // on the order of a hundred to a thousand events per SECOND, so a minute of
+    // total silence across four program subscriptions is already deep into
+    // impossible. Being deaf for five minutes is most of a position's life.
+    const DATA_TIMEOUT: Duration = Duration::from_secs(60);
     let mut last_data = Instant::now();
 
     loop {

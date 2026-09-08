@@ -76,6 +76,13 @@ pub struct FollowedWallet {
 pub struct RpcConfig {
     pub http_url: String,
     pub ws_url: String,
+    /// Tried when `ws_url` goes deaf. Measured 8 Sep 2026: publicnode accepted
+    /// subscriptions and delivered ZERO events over 20s while the official
+    /// endpoint delivered 20,405 on the identical filter and the chain advanced
+    /// 21 slots in 6s. A single endpoint is a single point of silence, and
+    /// silence is the failure this bot is worst at noticing.
+    #[serde(default)]
+    pub ws_fallback_url: Option<String>,
     pub jupiter_url: String,
     #[serde(default = "d_timeout")]
     pub timeout_ms: u64,

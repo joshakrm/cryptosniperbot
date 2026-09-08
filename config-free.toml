@@ -22,7 +22,22 @@
 # A public RPC will rate-limit you into uselessness. Get a free key from
 # Helius / QuickNode / Triton and paste the URLs here.
 http_url  = "https://solana-rpc.publicnode.com"
-ws_url    = "wss://solana-rpc.publicnode.com"
+ws_url          = "wss://api.mainnet-beta.solana.com"
+                           # PRIMARY. Measured 8 Sep 2026 over 60s on the same
+                           # logsSubscribe filter: this endpoint showed 10157
+                           # events and 44 launches; publicnode showed ZERO of
+                           # either, while the chain advanced normally. Even on a
+                           # good day publicnode ran ~107 events/sec against this
+                           # endpoint's ~1188, so the bot's historical 635
+                           # launches/hour was roughly a quarter of the ~2600/hour
+                           # actually happening. It was not selecting badly so much
+                           # as looking through a keyhole.
+ws_fallback_url = "wss://solana-rpc.publicnode.com"
+                           # demoted to fallback: it accepts subscriptions and
+                           # then delivers nothing, sometimes on SOME
+                           # subscriptions only, which no liveness check that
+                           # counts total frames can see.
+
 jupiter_url = "https://lite-api.jup.ag/swap/v1"
 # Minimum gap between Jupiter requests, shared by screening and marks.
 # The free tier throttles near 1/sec; queueing beats firing and failing,
