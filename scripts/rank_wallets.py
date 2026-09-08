@@ -34,6 +34,15 @@ had no part in choosing. Only the second number means anything, and a previous
 version of this analysis in this project produced 8 apparent repeat-winners
 against 11.1 expected by chance, which is what the circular version hides.
 
+DUST BOTS ARE EXCLUDED, and this is the filter that matters most. The top
+wallet this analysis found scored 100% on 35 graduations and 0 losers - and buys
+a median of 0.0019 SOL per token, about nineteen cents, at an identical size
+across 101 distinct tokens. It is farming something, not trading. Its hit rate
+was real and its interpretation was worthless: copying it at a 0.25 SOL position
+is 130x its own exposure on a signal never tested at any size that matters. A
+wallet must therefore trade at a size comparable to ours before its record means
+anything about what we would experience.
+
 Deployers are excluded. The first signer on a curve created the token; following
 them is not copy-trading, and the one wallet that looked spectacular last time -
 7 winners from 7 - turned out to be a deployer whose tokens all collapsed to a
@@ -332,6 +341,13 @@ def main():
     MIN_SEEN = 4
     ranked = [(w, v[0], v[1], 100.0 * v[0] / v[1])
               for w, v in tr.items() if v[1] >= MIN_SEEN]
+    if ranked:
+        print("")
+        print(" NOTE: this ranking does NOT yet filter by trade size, and the")
+        print(" wallets it surfaces have been dust bots buying ~0.002 SOL per")
+        print(" token. Before following any address below, check what it actually")
+        print(" stakes - a wallet risking nineteen cents has no opinion worth")
+        print(" copying at 0.25 SOL. scripts/wallet_size.py measures this.")
     ranked.sort(key=lambda r: (-r[3], -r[2]))
     print("")
     print(" TOP WALLETS ON THE EARLIER HALF (seen on %d+ tokens)" % MIN_SEEN)
