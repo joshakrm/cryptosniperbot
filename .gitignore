@@ -12,3 +12,5 @@ social_cache.json
 candidate_mints.json
 closed_mints.txt
 wallet_cache.json
+curve_outcomes.json
+early_buyers.json
