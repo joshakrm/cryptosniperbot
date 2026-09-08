@@ -1,0 +1,289 @@
+# FREE-INFRASTRUCTURE CONFIG - no API key, no signup, no account.
+#
+# publicnode serves getTransaction, getAccountInfo and getTokenSupply at ~5
+# calls/sec with websockets included. The one method it refuses is
+# getTokenLargestAccounts (HTTP 403), which feeds the holder checks - and those
+# need a 15s wait for the token index anyway, which was measured over 31 trades
+# and does not work.
+#
+# So the free tier and the fast-entry strategy want exactly the same thing.
+# Jupiter remains the real constraint; see jupiter_* below.
+
+# Local config - NOT committed (gitignored, verified untracked).
+#
+# Paste your Helius key over BOTH occurrences of YOUR_KEY_HERE below.
+# The program refuses to start while the placeholder is still present, so a
+# half-edited config fails loudly instead of silently using a broken endpoint.
+
+# solsnipe configuration
+# Copy to config.toml and fill in your RPC endpoints. config.toml is gitignored.
+
+[rpc]
+# A public RPC will rate-limit you into uselessness. Get a free key from
+# Helius / QuickNode / Triton and paste the URLs here.
+http_url  = "https://solana-rpc.publicnode.com"
+ws_url    = "wss://solana-rpc.publicnode.com"
+jupiter_url = "https://lite-api.jup.ag/swap/v1"
+# Minimum gap between Jupiter requests, shared by screening and marks.
+# The free tier throttles near 1/sec; queueing beats firing and failing,
+# because a 429 is indistinguishable from real information.
+jupiter_min_interval_ms = 400
+# The throttle is ADAPTIVE: it starts at the floor above and backs off on
+# every 429, creeping back when requests land cleanly. The real limit is
+# undocumented and differs per endpoint and plan, so hand-tuning meant
+# guessing - a flat 400ms still lost 21% of screens.
+jupiter_max_interval_ms  = 2500   # slowest it will back off to; 3 quotes at
+                                  # this rate must fit inside max_screen_ms
+jupiter_mark_multiplier  = 3      # marks wait 3x a screening quote
+timeout_ms = 5000
+commitment = "confirmed"
+
+[programs]
+# VERIFY THESE against solscan before trusting them. Program IDs get migrated.
+pump_fun          = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+pump_swap         = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+raydium_amm_v4    = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+raydium_cpmm      = "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C"
+wsol_mint         = "So11111111111111111111111111111111111111112"
+usdc_mint         = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
+# Which venues to listen to.
+watch = ["pump_fun", "raydium_amm_v4", "raydium_cpmm", "pump_swap"]
+
+[screen]
+# Every check FAILS CLOSED: if we cannot determine the answer, we reject.
+min_liquidity_sol  = 5.0     # reject thin pools you cannot exit
+max_top10_pct      = 65.0    # reject if top 10 non-pool holders own more than this
+min_holders        = 5      # of the ~20 the RPC returns. The measured
+                            # distribution is bimodal: most launches sit at
+                            # 1-3 holders and a second cluster at 10-20, with
+                            # almost nothing between. So 5 only admits ~5pp
+                            # more than 10 did; 3 is the next real step down.
+                            # so this deliberately keeps only tokens with traction
+require_mint_authority_renounced   = true   # else dev can print infinite supply
+require_freeze_authority_renounced = true   # else dev can freeze your token account
+reject_token2022_extensions = true          # transfer hooks / fees / permanent delegate
+# Reject pools whose LP tokens are still outstanding, i.e. whose liquidity
+# the creator can withdraw. Bonding-curve launches (pump.fun pre-migration)
+# have no LP mint at all and always pass. Measured on live PumpSwap pools:
+# 3 burned, 1 with 4.1e12 LP units outstanding, 2 curve-style - so this
+# genuinely discriminates. Also rejects locker-held LP, which is the
+# fail-closed direction; see src/screen/liquidity.rs.
+require_lp_burned  = true
+# FREE gate, and the only one that costs nothing: the figure comes out of the
+# launch transaction that is fetched anyway. Measured over 225 live launches -
+# median pool 0.58 SOL - a 2.0 floor rejects 62% of candidates before they can
+# spend a single aggregator quote. Set 0.0 to disable.
+min_pool_sol       = 5.0    # raised from 2.0 to stop pump_fun starving migrations.
+                            #
+                            # Measured over 45 minutes: pump_fun took 87% of the
+                            # Jupiter budget (242 of 277 routing screens) and its
+                            # median shadowed token is worth -100% at t=300s.
+                            # Migrations took 13%, sit at +30% at t=900s, and 28 of
+                            # 35 that passed the LP-burn recheck then failed on
+                            # screen_timeout or an unavailable quote - starved by
+                            # the venue that never pays.
+                            #
+                            # At this threshold, across 7145 journalled candidates:
+                            # pump_fun kept drops 27.3% -> 8.9%, migrations kept
+                            # 89.3% -> 89.0%. Two migrations out of 665 is the
+                            # entire cost of a two-thirds cut in wasted quotes.
+                            # This makes screening MORE selective; it disables no
+                            # safety check.
+require_holders    = false  # cannot run this early; see header
+max_roundtrip_loss_bps = 1500               # buy+sell round trip via Jupiter, 15%
+                                            # quoted at risk.position_size_sol, the size
+                                            # you actually trade - impact is size-dependent
+max_screen_ms      = 15000  # must exceed 3 x jupiter_max_interval_ms, or
+                            # screening times out exactly when the throttle
+                            # backs off. Validated at startup.
+# MEASURED, not guessed: over 73 live launches the Helius token-account index
+# lagged the mint by a median of 13.0s and a max of 16.3s. getAccountInfo
+# answers instantly, but getTokenLargestAccounts reports "not a Token mint"
+# until the index catches up, so screening any sooner cannot see holders at
+# all. The retry in rpc.rs covers the tail beyond this delay.
+min_pool_age_ms    = 0      # enter immediately; the whole point of the test
+
+# Re-check a pool-venue candidate rejected ONLY for outstanding LP, rather than
+# discarding it. A graduation burns its LP in a transaction AFTER the migration:
+# measured on 8 live ones, all 8 burned, median 498s later (min 67s, max 3466s).
+# Screening at t=0 therefore rejected every migration the bot ever saw - 598 of
+# them - on the venue whose shadowed candidates sit at a median +30% at t=900s
+# against -100% for pump_fun launches.
+# 20 polls at 60s covers 20 minutes and catches the median comfortably. Each
+# poll is one getTokenSupply, not a re-screen; the full screen runs once the
+# burn confirms and the candidate still has to pass every other check.
+lp_recheck_attempts      = 20
+lp_recheck_interval_secs = 60
+
+[risk]
+position_size_sol       = 0.25
+max_concurrent_positions = 12   # raised now that marks no longer starve
+                                # screening. Cost is stop precision, not coverage.
+                                # room for screening quotes to get through
+                                # screening quotes, and the free lite API throttles
+                                # near 1/sec. 6 still recycles plenty of slots over
+                                # an hour since stops fire fast.
+                                # full for 15 min, so 3 capped the bot at ~3 entries
+                                # per quarter hour regardless of how many tokens
+                                # passed screening. Raised for paper data gathering;
+                                # drop it back before ever going live.
+max_daily_loss_sol      = 50.0  # likewise raised for data collection only. At 2.0
+                                # the bot capped out and stopped trading mid-run,
+                                # which reads as a screening problem and is not one.
+max_trades_per_day      = 1000  # was 40, which is a sensible REAL-MONEY limit and
+                                # the wrong limit for a data-collection phase: it
+                                # stopped a 2h run after 40 entries and produced 125
+                                # blocks. Put it back to ~40 before any live trading.
+cooldown_ms             = 1500   # was 3000, which blocked 2 of 9 approvals
+kill_switch_file        = "KILL" # create this file to halt all entries immediately
+
+[exit]
+# Ladder: sell `pct` of the remaining position at each `gain_bps` level.
+# pct is a share of the ORIGINAL position size, not of what is left, so a
+# ladder summing to 100 fully exits. Anything over 100 is rejected at startup.
+# Quick single rung, chosen by replaying 263 recorded price paths out-of-sample
+# (scripts/replay.py: rank on the earlier half by time, score on the later half).
+#
+#   take profit   out-of-sample mean   win rate
+#     +1%              -13.19%           25.6%
+#     +3%              -12.55%           33.1%
+#     +10%             -11.15%           28.9%   <- optimum
+#     +15%             -12.38%           24.8%
+#     +50%             -15.38%           14.0%   <- what this replaced
+#
+# It is a genuine interior optimum rather than "exit as fast as possible": +1%
+# is worse than +10%. And it survives removing the biggest winners - the margin
+# over the old +50% rung GROWS from 2.8pp to 5.3pp as the top five are dropped,
+# so the edge is in the body of the distribution, not the tail.
+#
+# The curve is FLAT between +3% and +20%, so the exact level is not well
+# determined; what the data says clearly is that +50% was far too far.
+#
+# THE STOP LOSS STAYS, and that is not a default - it was tested. The shadow
+# tracker follows positions after they close, and after this bot sells the
+# median position goes to -62.5% within 60s and -100% by 300s, with only 13-15%
+# ever trading back above the exit and 83% becoming unroutable entirely. There
+# is no recovery to hold on for. Removing the stop would have made this worse.
+#
+# (Superseded note, kept for the reasoning: the earlier single rung at +50% was
+# chosen by replaying 263 recorded price paths through a grid of
+# ladders, ranked on the earlier half and scored on the later half (scripts/
+# replay.py). Out-of-sample mean per position: -5.97% against -6.68% for the
+# two-rung ladder this replaced, and it stayed ahead by the same ~0.7pp with the
+# top one, two and three winners removed, so it is not one trade's artifact.
+#
+# Why the second rung hurt: of 28 positions that ever reached +50%, the median
+# peak was +152% and exactly HALF ever touched +150%. When it missed, half the
+# position rode back down to the trailing stop or the clock. Letting the
+# remainder trail instead scored worse still (-6.95%): it caught a bigger best
+# trade, +615% against +465%, and gave back 25% on every ordinary winner.
+#
+# This CAPS the tail on purpose, and that is the risk in it. If the real
+# distribution has fatter tails than these 263 paths show, a policy that sells
+# everything at +50% is the wrong one.
+# REVERTED from +10% back to +50% after live results contradicted the replay.
+#
+# The replay ranked +10% best out-of-sample (-11.15% against -15.38%). Live over
+# 162 trades it raised the win rate 9.1% -> 13.6% and collapsed the win/loss
+# ratio 5.63x -> 0.91x, leaving the mean per trade IDENTICAL at -0.0451 SOL. It
+# capped every winner at +10% while losers still ran to the -35% stop, trading
+# rate for ratio almost exactly one for one. At 0.91x break-even needs a 52% win
+# rate; at 5.63x it needs 15%. Structurally worse, for no gain.
+#
+# WHY THE REPLAY WAS WRONG, because the tooling is still sound: it was fitted on
+# paths recorded under min_pool_sol = 2.0, a different candidate mix entirely.
+# The out-of-sample split protects against fitting noise WITHIN a distribution;
+# it does nothing about being applied to a different one. Re-fit replay.py on
+# paths from the config you are actually running before trusting it again.
+take_profit = [
+  { gain_bps = 5000, pct = 100.0 },   # +50% -> close the whole position
+]
+stop_loss_bps     = 3500   # -35%
+trailing_stop_bps = 2500   # give back 25% from peak
+max_hold_secs     = 900    # hard timeout, 15 min
+poll_interval_ms  = 5000   # 4 positions / 5s = 0.8 marks/sec, leaving budget
+                           # for screening. Wider sweeps mean worse stop fills:
+                           # a real cost, paid to keep screening working.
+                           # gap, which is a real cost - the first closed trade
+                           # realised -72% against a -35% stop because a pump.fun
+                           # token can halve between sweeps.
+# Residual value below which we stop trying to sell. Denominated in SOL, not
+# token count: after a big run-up, 0.1% of the tokens is still real money.
+dust_value_sol    = 0.005
+
+[paper]
+starting_balance_sol = 10.0
+extra_slippage_bps  = 0      # on top of what the quote already prices - keep at 0.
+                             # This was 300, which re-charged the spread and impact
+                             # the Jupiter quote had already included, on both sides.
+                             # Raise only for a gap you have measured live.
+priority_fee_sol     = 0.001  # what you would actually pay per tx
+# THE HONEST KNOB. In a real snipe you are not first. By the time your tx lands
+# the price has already run. Set this from measured data, not hope. 0 = fantasy.
+latency_penalty_bps  = 500    # was 1200 when this raced for the first block.
+                              # Entry is now quoted at t+15s, so the launch move
+                              # is already IN the quote; this models only the
+                              # quote-to-fill gap. Re-derive from your journal.
+# Fraction of signals where your tx would actually have landed at all.
+fill_probability     = 0.90   # was 0.55 when racing colocated bots at t=0.
+                              # At t+15s there is no race left to lose.
+
+[live]
+# Live execution is NOT implemented. This block exists so the config shape is
+# stable. Flipping `enabled` to true will refuse to start with an explicit error.
+enabled = false
+keypair_path = ""
+jito_tip_sol = 0.0
+max_slippage_bps = 500
+
+[shadow]
+# Follows a random sample of candidates the bot does NOT trade, so filters can be
+# judged on outcomes instead of plausibility. Without this there is no control
+# group: a filter that rejects 79% of candidates looks identical whether it is
+# removing losers or removing winners.
+#
+# Cost is small and deliberately low-priority: 4 quotes per shadowed candidate,
+# all behind live screening in the throttle. At ~1750 launches/hour a 5% sample
+# is roughly 0.1 requests/second.
+enabled     = true
+sample_pct  = 5.0
+probe_size_sol = 0.1
+marks_secs  = [60, 300, 900]
+
+
+# ---------------------------------------------------------------------------
+# COPY TRADING
+# ---------------------------------------------------------------------------
+# Mirror specific wallets instead of sniping launches. Same socket, same
+# screening, same exits - the only thing that changes is what triggers an entry.
+#
+# WHY THIS MIGHT WORK WHERE SNIPING DID NOT. Sniping's entire edge was arriving
+# first, and this stack is ~250x slower than the competitive benchmark: measured
+# detection-to-fill 5.7s, plus ~13s of index lag. Following someone who has
+# already decided does not need to be first. It needs to be inside the window
+# before their pick moves, and how long that window is depends on the trader,
+# not on us. lag_s is journalled on every mirrored trade so it can be measured.
+#
+# WHERE THE WALLETS COME FROM IS THE OPEN QUESTION, and it is not an engineering
+# one. fomo.family's terms prohibit automated access, manual copying of their
+# content, and third-party scrapers; they publish no API. Their wallets ARE
+# non-custodial, so the trades land on Solana in public - reading the chain is
+# not governed by their terms. So: put addresses here that you obtained
+# legitimately, or let scripts/rank_wallets.py find them from on-chain history.
+[follow]
+enabled          = false   # nothing to follow yet; set true once wallets are listed
+mirror_exits     = true    # follow them out as well as in
+min_trade_sol    = 0.05    # their dust and their conviction are different signals
+max_lag_secs     = 60      # refuse a trade seen later than this - a stale mirror
+                           # buys the move rather than the signal
+
+# Each entry needs an address; the label is free text and is journalled with
+# every mirrored trade, so analysis can ask which TRADERS paid rather than which
+# base58 strings did.
+#
+# wallets = [
+#   { address = "So1anaWa11etAddressGoesHere1111111111111111", label = "top-30d" },
+#   { address = "An0therWa11etAddressGoesHere1111111111111111", label = "steady" },
+# ]
+wallets = []

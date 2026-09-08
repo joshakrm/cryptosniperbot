@@ -2,6 +2,7 @@ mod config;
 mod curve;
 mod decode;
 mod exec;
+mod follow;
 mod ingest;
 mod journal;
 mod position;
@@ -13,6 +14,7 @@ mod types;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use chrono::Utc;
 use serde_json::json;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -30,7 +32,7 @@ use crate::position::PositionManager;
 use crate::risk::RiskManager;
 use crate::rpc::{CurveThenJupiter, Jupiter, JupiterPrices, PriceSource, SolanaRpc};
 use crate::screen::{LaunchContext, Screener};
-use crate::types::{Severity, Venue};
+use crate::types::{ExitReason, Severity, Venue};
 
 #[derive(Parser)]
 #[command(
@@ -249,8 +251,15 @@ async fn run(config_path: &Path, journal_path: &Path) -> Result<()> {
         // Screening costs several round trips. Doing it inline would stall the
         // websocket consumer and we would miss every launch that overlaps it.
         tokio::spawn(async move {
-            if let Err(e) = handle_candidate(ctx, hit).await {
-                warn!(error = %e, "candidate handling failed");
+            // A hit tagged with a wallet came from a followed trader, not from
+            // a venue program. Same socket, different question.
+            let res = if hit.wallet.is_some() {
+                handle_follow(ctx, hit).await
+            } else {
+                handle_candidate(ctx, hit).await
+            };
+            if let Err(e) = res {
+                warn!(error = %e, "hit handling failed");
             }
         });
     }
@@ -486,6 +495,171 @@ async fn handle_candidate(ctx: CandidateCtx, hit: ingest::LogHit) -> Result<()> 
     }
 
     Ok(())
+}
+
+/// Screen a mint and, if it passes, take a position.
+///
+/// Shared by both signals. A copied trade goes through exactly the same
+/// screening as a sniped one: their judgement replaces our selection, not our
+/// safety checks. A trader who is right about direction can still be buying
+/// something we would not be able to sell.
+async fn enter_mint(
+    ctx: CandidateCtx,
+    mint: String,
+    venue: Venue,
+    decimals: u8,
+    curve: Option<String>,
+) -> Result<()> {
+    let launch = LaunchContext {
+        curve: curve.clone(),
+        ..Default::default()
+    };
+    let report = ctx.screener.screen(&mint, venue, &launch).await;
+    ctx.journal.write_typed("screen", &report).await;
+
+    if !report.approved() {
+        info!(%mint, "{}", report.summary());
+        return Ok(());
+    }
+    let entry_price = match report.quoted_price_sol {
+        Some(p) if p > 0.0 => p,
+        _ => return Ok(()),
+    };
+
+    let decision = ctx.risk.try_enter().await;
+    if !decision.allowed() {
+        if let crate::risk::RiskDecision::Block(reason) = &decision {
+            info!(%mint, %reason, "approved but blocked by risk");
+            ctx.journal
+                .write("risk_block", json!({ "mint": mint, "reason": reason }))
+                .await;
+        }
+        return Ok(());
+    }
+
+    let size = ctx.cfg.risk.position_size_sol;
+    let bought = match ctx.executor.buy(&mint, size, entry_price).await {
+        Ok(b) => b,
+        Err(e) => {
+            ctx.risk.release_entry().await;
+            return Err(e);
+        }
+    };
+    match bought {
+        Some(fill) => {
+            ctx.journal.write_typed("fill_buy", &fill).await;
+            ctx.pm.open(mint.clone(), venue, decimals, curve, &fill).await;
+            let (trades, pnl, open) = ctx.risk.snapshot().await;
+            let balance = ctx.executor.balance_sol().await;
+            info!(%mint, price = fill.price_sol, sol = fill.sol_amount,
+                  open, trades_today = trades, pnl_today = pnl, balance, "ENTERED");
+        }
+        None => {
+            ctx.risk.release_entry().await;
+            ctx.journal
+                .write("missed", json!({ "mint": mint, "reason": "no fill" }))
+                .await;
+        }
+    }
+    Ok(())
+}
+
+/// Mirror a followed wallet's trade.
+///
+/// The entry still passes through screening. Copying someone does not make
+/// their pick safe - a trader who is right about direction can still be buying
+/// a token with a transfer hook that stops US selling, and they may be able to
+/// exit a honeypot we cannot. Their judgement replaces our SELECTION, not our
+/// safety checks.
+async fn handle_follow(ctx: CandidateCtx, hit: ingest::LogHit) -> Result<()> {
+    let wallet = match hit.wallet.as_deref() {
+        Some(w) => w,
+        None => return Ok(()),
+    };
+    let seen_at = Utc::now();
+
+    let tx = match fetch_tx_with_retry(&ctx.rpc, &hit.signature).await {
+        Some(t) => t,
+        None => return Ok(()),
+    };
+
+    let quotes = ctx.cfg.programs.quote_mints();
+    let swap = match crate::follow::detect_swap(&tx, wallet, &quotes) {
+        Some(s) => s,
+        // Most of a wallet's activity is not a trade. Silence is the norm here.
+        None => return Ok(()),
+    };
+
+    // How far behind them we are. Journalled on every mirrored trade because
+    // whether copy-trading can work at all is a question about this number
+    // against the followed trader's holding period, and neither is worth
+    // guessing at.
+    let block_time = tx.get("blockTime").and_then(|v| v.as_i64());
+    let lag_s = block_time
+        .map(|t| seen_at.timestamp() - t)
+        .unwrap_or(-1);
+
+    // The label travels with the trade so a later analysis can ask which
+    // TRADERS were worth following, not which base58 strings were.
+    let label = ctx
+        .cfg
+        .follow
+        .wallets
+        .iter()
+        .find(|w| w.address == swap.wallet)
+        .map(|w| w.label.clone())
+        .unwrap_or_default();
+
+    ctx.journal
+        .write(
+            "follow_swap",
+            json!({
+                "wallet": swap.wallet,
+                "label": label,
+                "mint": swap.mint,
+                "direction": format!("{:?}", swap.direction),
+                "tokens": swap.tokens,
+                "sol": swap.sol,
+                "price_sol": swap.price(),
+                "lag_s": lag_s,
+                "signature": hit.signature,
+            }),
+        )
+        .await;
+
+    match swap.direction {
+        crate::follow::Direction::Sell => {
+            if !ctx.cfg.follow.mirror_exits {
+                return Ok(());
+            }
+            // Mirroring their exit. If we are not in it, there is nothing to do.
+            if ctx.pm.is_open(&swap.mint).await {
+                info!(mint = %swap.mint, %wallet, lag_s, "FOLLOWED SELL - closing");
+                ctx.pm
+                    .close_now(&swap.mint, ExitReason::FollowedExit)
+                    .await;
+            }
+            Ok(())
+        }
+        crate::follow::Direction::Buy => {
+            if swap.sol < ctx.cfg.follow.min_trade_sol {
+                debug!(mint = %swap.mint, sol = swap.sol, "followed buy too small - ignoring");
+                return Ok(());
+            }
+            if lag_s > ctx.cfg.follow.max_lag_secs {
+                info!(mint = %swap.mint, lag_s, "followed buy seen too late - ignoring");
+                ctx.journal
+                    .write("follow_stale", json!({ "mint": swap.mint, "lag_s": lag_s }))
+                    .await;
+                return Ok(());
+            }
+            if ctx.pm.is_open(&swap.mint).await {
+                return Ok(());
+            }
+            info!(mint = %swap.mint, %wallet, sol = swap.sol, lag_s, "FOLLOWED BUY");
+            enter_mint(ctx, swap.mint.clone(), Venue::Unknown, swap.decimals, None).await
+        }
+    }
 }
 
 async fn fetch_tx_with_retry(rpc: &SolanaRpc, sig: &str) -> Option<serde_json::Value> {

@@ -140,6 +140,9 @@ pub enum ExitReason {
     MaxHold,
     KillSwitch,
     Unroutable,
+    /// The wallet we were mirroring sold. Distinct from our own price rules so
+    /// a later analysis can ask whether following them out beat our stop.
+    FollowedExit,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

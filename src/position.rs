@@ -399,6 +399,32 @@ impl PositionManager {
     /// Zero for a genuine rug, the last observed price for one we simply cannot
     /// see any more. The second is a stale valuation and the journal records it
     /// as such, but the alternative is holding the slot forever.
+    /// Close a position now, at whatever the market currently pays.
+    ///
+    /// Used to mirror a followed wallet's exit. Prices the position first so
+    /// the trade is booked at a real quote rather than a stale mark - and if it
+    /// cannot be priced, closes at the last observed price anyway, because the
+    /// alternative is holding something we have decided to be out of.
+    pub async fn close_now(&self, mint: &str, reason: ExitReason) {
+        let pos = { self.positions.lock().await.get(mint).cloned() };
+        let pos = match pos {
+            Some(p) => p,
+            None => return,
+        };
+        let priced = self
+            .prices
+            .mark(&pos.mint, pos.tokens_held, pos.decimals, pos.curve.as_deref())
+            .await;
+        match priced {
+            Ok(Some(price)) if price > 0.0 => self.exit_all(&pos, price, reason).await,
+            _ => {
+                let stale = pos.last_price_sol.unwrap_or(pos.entry_price_sol);
+                warn!(%mint, stale, "mirroring an exit but could not price - closing at last mark");
+                self.force_close(mint, stale, reason).await;
+            }
+        }
+    }
+
     async fn force_close(&self, mint: &str, price: f64, reason: ExitReason) {
         let removed = { self.positions.lock().await.remove(mint) };
         if let Some(p) = removed {

@@ -14,6 +14,62 @@ pub struct Config {
     pub live: LiveConfig,
     #[serde(default)]
     pub shadow: ShadowConfig,
+    #[serde(default)]
+    pub follow: FollowConfig,
+}
+
+/// Copy-trading: mirror the trades of specific wallets instead of sniping new
+/// launches.
+///
+/// The signal is the same plumbing pointed somewhere else - logsSubscribe takes
+/// any pubkey in `mentions`, so a wallet subscribes exactly as a program does.
+/// What changes is the question: not "has a pool appeared" but "has someone I
+/// follow taken a position".
+///
+/// It also changes the latency requirement, which is the point. Sniping's whole
+/// edge was arriving first, and this stack is ~250x slower than the competitive
+/// benchmark. Following someone who has already decided does not need to be
+/// first - it needs to be inside the window before their pick moves. Whether
+/// that window exists is a property of the traders followed, not of the bot,
+/// and lag_ms is journalled on every mirrored trade so it can be measured
+/// rather than assumed.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct FollowConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Wallets to mirror. Empty is not an error - it is a bot with nothing to
+    /// follow, which is the honest state before any wallet has been justified.
+    #[serde(default)]
+    pub wallets: Vec<FollowedWallet>,
+    /// Mirror their exits as well as their entries. With this off, entries are
+    /// copied and the existing stop/take-profit rules run the exit.
+    ///
+    /// On, the exit is hostage to seeing their sell promptly: if they front-run
+    /// the people following them, we sell after they do, at their price minus
+    /// our lag. The stop loss stays armed underneath either way.
+    #[serde(default = "d_mirror_exits")]
+    pub mirror_exits: bool,
+    /// Ignore a trade smaller than this. A trader's dust and their conviction
+    /// are different signals and only one is worth copying.
+    #[serde(default = "d_min_follow_sol")]
+    pub min_trade_sol: f64,
+    /// Refuse to copy a trade seen later than this. A stale mirror buys the
+    /// move rather than the signal.
+    #[serde(default = "d_max_lag_secs")]
+    pub max_lag_secs: i64,
+}
+fn d_mirror_exits() -> bool { true }
+fn d_min_follow_sol() -> f64 { 0.05 }
+fn d_max_lag_secs() -> i64 { 60 }
+
+/// One wallet worth following, and why.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FollowedWallet {
+    pub address: String,
+    /// Free text. Recorded in the journal so a later analysis can ask which
+    /// wallets were worth following rather than which addresses they were.
+    #[serde(default)]
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

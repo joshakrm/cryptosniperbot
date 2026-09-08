@@ -13,6 +13,10 @@ use crate::types::Venue;
 /// A raw log notification, tagged with the venue whose subscription produced it.
 #[derive(Debug, Clone)]
 pub struct LogHit {
+    /// Set when this subscription was a followed WALLET rather than a venue
+    /// program. Copy-trading and sniping share one socket and one reconnect
+    /// path; only the question asked of the transaction differs.
+    pub wallet: Option<String>,
     pub venue: Venue,
     /// The program whose subscription produced this. Needed downstream to scope
     /// log markers to the program that actually emitted them.
@@ -45,7 +49,20 @@ pub async fn run(cfg: Config, tx: mpsc::Sender<LogHit>) -> Result<()> {
 }
 
 async fn connect_and_stream(cfg: &Config, out: &mpsc::Sender<LogHit>) -> Result<()> {
-    let watched = cfg.programs.watched()?;
+    let mut watched = cfg.programs.watched()?;
+
+    // Followed wallets subscribe through the same filter as programs: Solana's
+    // `mentions` takes any pubkey. Verified against the free endpoint before
+    // this existed - a wallet filter is accepted, and an idle wallet reports
+    // nothing, which is a fact about the wallet and not a refusal.
+    let followed: Vec<String> = if cfg.follow.enabled {
+        cfg.follow.wallets.iter().map(|w| w.address.clone()).collect()
+    } else {
+        Vec::new()
+    };
+    for addr in &followed {
+        watched.push((format!("wallet:{addr}"), addr.clone()));
+    }
 
     let (ws, _) = tokio_tungstenite::connect_async(cfg.rpc.ws_url.as_str())
         .await
@@ -55,6 +72,8 @@ async fn connect_and_stream(cfg: &Config, out: &mpsc::Sender<LogHit>) -> Result<
     // Solana allows exactly one address per mentions filter, so each program
     // needs its own subscription on the shared socket.
     let mut pending: HashMap<u64, (Venue, String)> = HashMap::new();
+    // subscription label -> followed wallet, for tagging hits back to a wallet
+    let mut wallet_of: HashMap<u64, String> = HashMap::new();
     for (i, (label, program_id)) in watched.iter().enumerate() {
         let req_id = (i + 1) as u64;
         let msg = json!({
@@ -70,12 +89,16 @@ async fn connect_and_stream(cfg: &Config, out: &mpsc::Sender<LogHit>) -> Result<
             .send(Message::Text(msg.to_string()))
             .await
             .context("sending logsSubscribe")?;
+        if let Some(addr) = label.strip_prefix("wallet:") {
+            wallet_of.insert(req_id, addr.to_string());
+        }
         pending.insert(req_id, (Venue::from_label(label), program_id.clone()));
         info!(venue = %label, program = %program_id, "subscribing");
     }
 
     // subscription id -> (venue, program id)
     let mut subs: HashMap<u64, (Venue, String)> = HashMap::new();
+    let mut wallet_subs: HashMap<u64, String> = HashMap::new();
 
     // A half-open TCP connection never returns from next(): no data, no error,
     // no FIN. Unbounded, the reconnect-forever promise in run() silently never
@@ -155,6 +178,9 @@ async fn connect_and_stream(cfg: &Config, out: &mpsc::Sender<LogHit>) -> Result<
         ) {
             if let Some((venue, program_id)) = pending.remove(&id) {
                 info!(?venue, subscription = result, "subscribed");
+                if let Some(addr) = wallet_of.remove(&id) {
+                    wallet_subs.insert(result, addr);
+                }
                 subs.insert(result, (venue, program_id));
             }
             continue;
@@ -188,11 +214,11 @@ async fn connect_and_stream(cfg: &Config, out: &mpsc::Sender<LogHit>) -> Result<
             Some(p) => p,
             None => continue,
         };
-        let (venue, program_id) = params
-            .get("subscription")
-            .and_then(|x| x.as_u64())
+        let sub_id = params.get("subscription").and_then(|x| x.as_u64());
+        let (venue, program_id) = sub_id
             .and_then(|id| subs.get(&id).cloned())
             .unwrap_or((Venue::Unknown, String::new()));
+        let wallet = sub_id.and_then(|id| wallet_subs.get(&id).cloned());
 
         let result = match params.get("result") {
             Some(r) => r,
@@ -229,7 +255,7 @@ async fn connect_and_stream(cfg: &Config, out: &mpsc::Sender<LogHit>) -> Result<
             })
             .unwrap_or_default();
 
-        let hit = LogHit { venue, program_id, signature, slot, logs };
+        let hit = LogHit { wallet, venue, program_id, signature, slot, logs };
         if out.send(hit).await.is_err() {
             return Ok(()); // consumer gone
         }
